@@ -6495,6 +6495,98 @@ async function saveCard() {
 // 【自动发货菜单】相关功能
 // ================================
 
+// 切换匹配类型字段显示（添加规则模态框）
+function toggleMatchTypeFields() {
+    const matchType = document.getElementById('matchType').value;
+    const keywordField = document.getElementById('keywordField');
+    const itemSelectField = document.getElementById('itemSelectField');
+
+    if (matchType === 'item_id') {
+    keywordField.style.display = 'none';
+    itemSelectField.style.display = 'block';
+    // 加载商品列表
+    loadItemsForSelect();
+    } else {
+    keywordField.style.display = 'block';
+    itemSelectField.style.display = 'none';
+    }
+}
+
+// 切换匹配类型字段显示（编辑规则模态框）
+function toggleEditMatchTypeFields() {
+    const matchType = document.getElementById('editMatchType').value;
+    const keywordField = document.getElementById('editKeywordField');
+    const itemSelectField = document.getElementById('editItemSelectField');
+
+    if (matchType === 'item_id') {
+    keywordField.style.display = 'none';
+    itemSelectField.style.display = 'block';
+    // 加载商品列表
+    loadItemsForEditSelect();
+    } else {
+    keywordField.style.display = 'block';
+    itemSelectField.style.display = 'none';
+    }
+}
+
+// 加载商品列表用于选择（添加规则）
+async function loadItemsForSelect() {
+    try {
+    const response = await fetch(`${apiBase}/items?cookie_id=${currentCookieId || ''}`, {
+        headers: {
+        'Authorization': `Bearer ${authToken}`
+        }
+    });
+
+    if (response.ok) {
+        const data = await response.json();
+        const items = data.items || data || [];
+        const select = document.getElementById('selectedItem');
+
+        // 清空现有选项
+        select.innerHTML = '<option value="">请选择商品</option>';
+
+        items.forEach(item => {
+        const option = document.createElement('option');
+        option.value = item.item_id;
+        option.textContent = `${item.item_title || item.item_id} (${item.item_id})`;
+        select.appendChild(option);
+        });
+    }
+    } catch (error) {
+    console.error('加载商品列表失败:', error);
+    }
+}
+
+// 加载商品列表用于选择（编辑规则）
+async function loadItemsForEditSelect() {
+    try {
+    const response = await fetch(`${apiBase}/items?cookie_id=${currentCookieId || ''}`, {
+        headers: {
+        'Authorization': `Bearer ${authToken}`
+        }
+    });
+
+    if (response.ok) {
+        const data = await response.json();
+        const items = data.items || data || [];
+        const select = document.getElementById('editSelectedItem');
+
+        // 清空现有选项
+        select.innerHTML = '<option value="">请选择商品</option>';
+
+        items.forEach(item => {
+        const option = document.createElement('option');
+        option.value = item.item_id;
+        option.textContent = `${item.item_title || item.item_id} (${item.item_id})`;
+        select.appendChild(option);
+        });
+    }
+    } catch (error) {
+    console.error('加载商品列表失败:', error);
+    }
+}
+
 // 加载发货规则列表
 async function loadDeliveryRules() {
     try {
@@ -6547,6 +6639,15 @@ function renderDeliveryRulesList(rules) {
         '<span class="badge bg-success">启用</span>' :
         '<span class="badge bg-secondary">禁用</span>';
 
+    // 匹配类型标签
+    const matchType = rule.match_type || 'keyword';
+    let matchTypeBadge = '';
+    if (matchType === 'item_id') {
+        matchTypeBadge = '<span class="badge bg-danger ms-1"><i class="bi bi-hash"></i> ID匹配</span>';
+    } else {
+        matchTypeBadge = '<span class="badge bg-secondary ms-1"><i class="bi bi-fonts"></i> 关键字</span>';
+    }
+
     // 卡券类型标签
     let cardTypeBadge = '<span class="badge bg-secondary">未知</span>';
     if (rule.card_type) {
@@ -6569,10 +6670,19 @@ function renderDeliveryRulesList(rules) {
         }
     }
 
+    // 根据匹配类型显示不同的匹配内容
+    let matchContent = '';
+    if (matchType === 'item_id') {
+        matchContent = `<div class="fw-bold"><i class="bi bi-hash text-danger"></i> ${rule.item_id || '未知商品ID'}</div>`;
+    } else {
+        matchContent = `<div class="fw-bold">${rule.keyword || ''}</div>`;
+    }
+
     tr.innerHTML = `
         <td>
-        <div class="fw-bold">${rule.keyword}</div>
-        ${rule.description ? `<small class="text-muted">${rule.description}</small>` : ''}
+        ${matchContent}
+        ${matchTypeBadge}
+        ${rule.description ? `<small class="text-muted d-block">${rule.description}</small>` : ''}
         </td>
         <td>
         <div>
@@ -6716,19 +6826,31 @@ async function loadCardsForSelect() {
 // 保存发货规则
 async function saveDeliveryRule() {
     try {
+    const matchType = document.getElementById('matchType').value;
     const keyword = document.getElementById('productKeyword').value;
+    const itemId = document.getElementById('selectedItem').value;
     const cardId = document.getElementById('selectedCard').value;
     const deliveryCount = document.getElementById('deliveryCount').value || 1;
     const enabled = document.getElementById('ruleEnabled').checked;
     const description = document.getElementById('ruleDescription').value;
 
-    if (!keyword || !cardId) {
-        showToast('请填写必填字段', 'warning');
+    // 根据匹配类型验证必填字段
+    if (matchType === 'keyword') {
+        if (!keyword || !cardId) {
+        showToast('请填写商品关键字和选择卡券', 'warning');
         return;
+        }
+    } else if (matchType === 'item_id') {
+        if (!itemId || !cardId) {
+        showToast('请选择商品和卡券', 'warning');
+        return;
+        }
     }
 
     const ruleData = {
-        keyword: keyword,
+        match_type: matchType,
+        keyword: matchType === 'keyword' ? keyword : null,
+        item_id: matchType === 'item_id' ? itemId : null,
         card_id: parseInt(cardId),
         delivery_count: parseInt(deliveryCount),
         enabled: enabled,
@@ -7134,7 +7256,23 @@ async function editDeliveryRule(ruleId) {
 
         // 填充编辑表单
         document.getElementById('editRuleId').value = rule.id;
-        document.getElementById('editProductKeyword').value = rule.keyword;
+
+        // 设置匹配类型
+        const matchType = rule.match_type || 'keyword';
+        document.getElementById('editMatchType').value = matchType;
+
+        // 根据匹配类型显示/隐藏相应字段
+        toggleEditMatchTypeFields();
+
+        // 填充关键字
+        document.getElementById('editProductKeyword').value = rule.keyword || '';
+
+        // 加载商品列表并设置当前选中的商品（如果是商品ID匹配）
+        if (matchType === 'item_id' && rule.item_id) {
+        await loadItemsForEditSelect();
+        document.getElementById('editSelectedItem').value = rule.item_id;
+        }
+
         document.getElementById('editDeliveryCount').value = rule.delivery_count || 1;
         document.getElementById('editRuleEnabled').checked = rule.enabled;
         document.getElementById('editRuleDescription').value = rule.description || '';
@@ -7222,19 +7360,31 @@ async function loadCardsForEditSelect() {
 async function updateDeliveryRule() {
     try {
     const ruleId = document.getElementById('editRuleId').value;
+    const matchType = document.getElementById('editMatchType').value;
     const keyword = document.getElementById('editProductKeyword').value;
+    const itemId = document.getElementById('editSelectedItem').value;
     const cardId = document.getElementById('editSelectedCard').value;
     const deliveryCount = document.getElementById('editDeliveryCount').value || 1;
     const enabled = document.getElementById('editRuleEnabled').checked;
     const description = document.getElementById('editRuleDescription').value;
 
-    if (!keyword || !cardId) {
-        showToast('请填写必填字段', 'warning');
+    // 根据匹配类型验证必填字段
+    if (matchType === 'keyword') {
+        if (!keyword || !cardId) {
+        showToast('请填写商品关键字和选择卡券', 'warning');
         return;
+        }
+    } else if (matchType === 'item_id') {
+        if (!itemId || !cardId) {
+        showToast('请选择商品和卡券', 'warning');
+        return;
+        }
     }
 
     const ruleData = {
-        keyword: keyword,
+        match_type: matchType,
+        keyword: matchType === 'keyword' ? keyword : null,
+        item_id: matchType === 'item_id' ? itemId : null,
         card_id: parseInt(cardId),
         delivery_count: parseInt(deliveryCount),
         enabled: enabled,

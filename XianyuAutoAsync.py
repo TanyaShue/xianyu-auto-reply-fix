@@ -5980,12 +5980,24 @@ Cookie数量: {cookie_count}
                 except Exception as e:
                     logger.error(f"获取订单规格信息失败: {self._safe_str(e)}，将使用兜底匹配")
 
-            # 智能匹配发货规则：优先精确匹配，然后兜底匹配
+            # 智能匹配发货规则：优先商品ID精确匹配，然后规格匹配，最后关键字匹配
             delivery_rules = []
             used_exact_match = False
+            used_item_id_match = False
 
-            # 第一步：如果有规格信息，尝试精确匹配多规格发货规则
-            if spec_name and spec_value:
+            # 第一步：商品ID精确匹配（优先级最高）
+            if item_id and item_id != "未知商品":
+                logger.info(f"尝试商品ID精确匹配发货规则: {item_id}")
+                delivery_rules = db_manager.get_delivery_rule_by_item_id(item_id, user_id=self.user_id)
+
+                if delivery_rules:
+                    logger.info(f"✅ 找到商品ID精确匹配的发货规则: {len(delivery_rules)}个")
+                    used_item_id_match = True
+                else:
+                    logger.info(f"❌ 未找到商品ID精确匹配的发货规则")
+
+            # 第二步：如果有规格信息且商品ID匹配失败，尝试精确匹配多规格发货规则
+            if not delivery_rules and spec_name and spec_value:
                 if spec_name_2 and spec_value_2:
                     logger.info(f"尝试精确匹配双规格发货规则: {search_text[:50]}... [{spec_name}:{spec_value}, {spec_name_2}:{spec_value_2}]")
                 else:
@@ -6000,13 +6012,13 @@ Cookie数量: {cookie_count}
                 else:
                     logger.info(f"❌ 未找到精确匹配的多规格发货规则")
 
-            # 第二步：如果精确匹配失败，尝试兜底匹配（普通发货规则）
+            # 第三步：如果商品ID匹配和精确匹配都失败，尝试关键字匹配（普通发货规则）
             if not delivery_rules:
-                logger.info(f"尝试兜底匹配普通发货规则: {search_text[:50]}...")
+                logger.info(f"尝试关键字匹配普通发货规则: {search_text[:50]}...")
                 delivery_rules = db_manager.get_delivery_rules_by_keyword(search_text, user_id=self.user_id)
 
                 if delivery_rules:
-                    logger.info(f"✅ 找到兜底匹配的普通发货规则: {len(delivery_rules)}个")
+                    logger.info(f"✅ 找到关键字匹配的普通发货规则: {len(delivery_rules)}个")
                 else:
                     logger.info(f"❌ 未找到任何匹配的发货规则")
 
@@ -6016,7 +6028,12 @@ Cookie数量: {cookie_count}
 
             # 使用第一个匹配的规则（按关键字长度降序排列，优先匹配更精确的规则）
             rule = delivery_rules[0]
-            match_mode = 'exact' if used_exact_match else 'fallback'
+            if used_item_id_match:
+                match_mode = 'item_id'
+            elif used_exact_match:
+                match_mode = 'exact'
+            else:
+                match_mode = 'fallback'
 
             # 注释掉自动发货时的商品信息保存逻辑，避免重复保存导致item_detail字段内容累积
             # 商品信息应该在商品列表获取、订单详情获取等其他环节已经保存过了
@@ -6038,7 +6055,10 @@ Cookie数量: {cookie_count}
             #     logger.warning(f"跳过保存商品信息：缺少商品标题 - {item_id}")
 
             # 详细的匹配结果日志
-            if rule.get('is_multi_spec'):
+            if used_item_id_match:
+                # 商品ID精确匹配
+                logger.info(f"🎯 商品ID精确匹配发货规则: {rule.get('item_id', item_id)} -> {rule['card_name']} ({rule['card_type']})")
+            elif rule.get('is_multi_spec'):
                 if spec_name and spec_value:
                     rule_spec_info = f"{rule['spec_name']}:{rule['spec_value']}"
                     if rule.get('spec_name_2') and rule.get('spec_value_2'):
@@ -6055,8 +6075,8 @@ Cookie数量: {cookie_count}
                     order_spec_info = f"{spec_name}:{spec_value}"
                     if spec_name_2 and spec_value_2:
                         order_spec_info += f", {spec_name_2}:{spec_value_2}"
-                    logger.info(f"🔄 兜底匹配普通发货规则: {rule['keyword']} -> {rule['card_name']} ({rule['card_type']})")
-                    logger.info(f"📋 订单规格: {order_spec_info} ➡️ 使用普通卡券兜底")
+                    logger.info(f"🔄 关键字匹配普通发货规则: {rule['keyword']} -> {rule['card_name']} ({rule['card_type']})")
+                    logger.info(f"📋 订单规格: {order_spec_info} ➡️ 使用普通卡券")
                 else:
                     logger.info(f"✅ 匹配普通发货规则: {rule['keyword']} -> {rule['card_name']} ({rule['card_type']})")
 

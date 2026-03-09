@@ -393,6 +393,16 @@ class DBManager:
             )
             ''')
 
+            # 检查并添加 match_type 和 item_id 列到 delivery_rules 表（用于商品ID匹配功能）
+            try:
+                self._execute_sql(cursor, "SELECT match_type FROM delivery_rules LIMIT 1")
+            except sqlite3.OperationalError:
+                # match_type 列不存在，需要添加
+                logger.info("正在为 delivery_rules 表添加 match_type 和 item_id 列...")
+                self._execute_sql(cursor, "ALTER TABLE delivery_rules ADD COLUMN match_type TEXT DEFAULT 'keyword'")
+                self._execute_sql(cursor, "ALTER TABLE delivery_rules ADD COLUMN item_id TEXT")
+                logger.info("delivery_rules 表 match_type 和 item_id 列添加完成")
+
             # 创建发货日志表（记录真实发货尝试结果：成功/失败）
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS delivery_logs (
@@ -4204,19 +4214,33 @@ Cookie数量: {cookie_count}
 
     # ==================== 自动发货规则方法 ====================
 
-    def create_delivery_rule(self, keyword: str, card_id: int, delivery_count: int = 1,
-                           enabled: bool = True, description: str = None, user_id: int = None):
-        """创建发货规则"""
+    def create_delivery_rule(self, keyword: str = None, card_id: int = None, delivery_count: int = 1,
+                           enabled: bool = True, description: str = None, user_id: int = None,
+                           match_type: str = 'keyword', item_id: str = None):
+        """创建发货规则
+
+        Args:
+            keyword: 商品关键字（关键字匹配时使用）
+            card_id: 卡券ID
+            delivery_count: 发货数量
+            enabled: 是否启用
+            description: 备注说明
+            user_id: 用户ID
+            match_type: 匹配类型，'keyword' 或 'item_id'
+            item_id: 商品ID（商品ID匹配时使用）
+        """
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+                # 当使用商品ID匹配时，keyword字段存储item_id值（解决NOT NULL约束）
+                actual_keyword = keyword if keyword else (item_id or '')
                 cursor.execute('''
-                INSERT INTO delivery_rules (keyword, card_id, delivery_count, enabled, description, user_id)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ''', (keyword, card_id, delivery_count, enabled, description, user_id))
+                INSERT INTO delivery_rules (keyword, card_id, delivery_count, enabled, description, user_id, match_type, item_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (actual_keyword, card_id, delivery_count, enabled, description, user_id, match_type, item_id))
                 self.conn.commit()
                 rule_id = cursor.lastrowid
-                logger.info(f"创建发货规则成功: {keyword} -> 卡券ID {card_id} (规则ID: {rule_id})")
+                logger.info(f"创建发货规则成功: {keyword or item_id} -> 卡券ID {card_id} (规则ID: {rule_id}, 匹配类型: {match_type})")
                 return rule_id
             except Exception as e:
                 logger.error(f"创建发货规则失败: {e}")
@@ -4231,6 +4255,7 @@ Cookie数量: {cookie_count}
                     cursor.execute('''
                     SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
                            dr.description, dr.delivery_times, dr.created_at, dr.updated_at,
+                           dr.match_type, dr.item_id,
                            c.name as card_name, c.type as card_type,
                            c.is_multi_spec, c.spec_name, c.spec_value,
                            c.spec_name_2, c.spec_value_2
@@ -4243,6 +4268,7 @@ Cookie数量: {cookie_count}
                     cursor.execute('''
                     SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
                            dr.description, dr.delivery_times, dr.created_at, dr.updated_at,
+                           dr.match_type, dr.item_id,
                            c.name as card_name, c.type as card_type,
                            c.is_multi_spec, c.spec_name, c.spec_value,
                            c.spec_name_2, c.spec_value_2
@@ -4263,18 +4289,90 @@ Cookie数量: {cookie_count}
                         'delivery_times': row[6],
                         'created_at': row[7],
                         'updated_at': row[8],
-                        'card_name': row[9],
-                        'card_type': row[10],
-                        'is_multi_spec': bool(row[11]) if row[11] is not None else False,
-                        'spec_name': row[12],
-                        'spec_value': row[13],
-                        'spec_name_2': row[14],
-                        'spec_value_2': row[15]
+                        'match_type': row[9] or 'keyword',
+                        'item_id': row[10],
+                        'card_name': row[11],
+                        'card_type': row[12],
+                        'is_multi_spec': bool(row[13]) if row[13] is not None else False,
+                        'spec_name': row[14],
+                        'spec_value': row[15],
+                        'spec_name_2': row[16],
+                        'spec_value_2': row[17]
                     })
 
                 return rules
             except Exception as e:
                 logger.error(f"获取发货规则列表失败: {e}")
+                return []
+
+    def get_delivery_rule_by_item_id(self, item_id: str, user_id: int = None):
+        """根据商品ID精确匹配发货规则
+
+        Args:
+            item_id: 商品ID
+            user_id: 用户ID，用于过滤只属于该用户的发货规则
+
+        Returns:
+            匹配的发货规则列表，按创建时间降序排列
+        """
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                if user_id is not None:
+                    cursor.execute('''
+                    SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
+                           dr.description, dr.delivery_times,
+                           c.name as card_name, c.type as card_type, c.api_config,
+                           c.text_content, c.data_content, c.image_url, c.enabled as card_enabled, c.description as card_description,
+                           c.delay_seconds as card_delay_seconds
+                    FROM delivery_rules dr
+                    LEFT JOIN cards c ON dr.card_id = c.id
+                    WHERE dr.enabled = 1 AND c.enabled = 1 AND dr.user_id = ?
+                    AND dr.match_type = 'item_id' AND dr.item_id = ?
+                    ORDER BY dr.id ASC
+                    ''', (user_id, item_id))
+                else:
+                    cursor.execute('''
+                    SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
+                           dr.description, dr.delivery_times,
+                           c.name as card_name, c.type as card_type, c.api_config,
+                           c.text_content, c.data_content, c.image_url, c.enabled as card_enabled, c.description as card_description,
+                           c.delay_seconds as card_delay_seconds
+                    FROM delivery_rules dr
+                    LEFT JOIN cards c ON dr.card_id = c.id
+                    WHERE dr.enabled = 1 AND c.enabled = 1
+                    AND dr.match_type = 'item_id' AND dr.item_id = ?
+                    ORDER BY dr.id ASC
+                    ''', (item_id,))
+
+                rules = []
+                for row in cursor.fetchall():
+                    rules.append({
+                        'id': row[0],
+                        'keyword': row[1],
+                        'card_id': row[2],
+                        'delivery_count': row[3],
+                        'enabled': bool(row[4]),
+                        'description': row[5],
+                        'delivery_times': row[6],
+                        'card_name': row[7],
+                        'card_type': row[8],
+                        'api_config': row[9],
+                        'text_content': row[10],
+                        'data_content': row[11],
+                        'image_url': row[12],
+                        'card_enabled': bool(row[13]) if row[13] is not None else False,
+                        'card_description': row[14],
+                        'card_delay_seconds': row[15] or 0,
+                        'match_type': 'item_id',
+                        'item_id': item_id
+                    })
+
+                if rules:
+                    logger.info(f"根据商品ID {item_id} 找到 {len(rules)} 个匹配的发货规则")
+                return rules
+            except Exception as e:
+                logger.error(f"根据商品ID获取发货规则失败: {e}")
                 return []
 
     def get_delivery_rules_by_keyword(self, keyword: str, user_id: int = None):
@@ -4298,6 +4396,7 @@ Cookie数量: {cookie_count}
                     FROM delivery_rules dr
                     LEFT JOIN cards c ON dr.card_id = c.id
                     WHERE dr.enabled = 1 AND c.enabled = 1 AND dr.user_id = ?
+                    AND (dr.match_type = 'keyword' OR dr.match_type IS NULL)
                     AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
                     ORDER BY
                         CASE
@@ -4316,6 +4415,7 @@ Cookie数量: {cookie_count}
                     FROM delivery_rules dr
                     LEFT JOIN cards c ON dr.card_id = c.id
                     WHERE dr.enabled = 1 AND c.enabled = 1
+                    AND (dr.match_type = 'keyword' OR dr.match_type IS NULL)
                     AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
                     ORDER BY
                         CASE
@@ -4353,7 +4453,8 @@ Cookie数量: {cookie_count}
                         'image_url': row[12],
                         'card_enabled': bool(row[13]),
                         'card_description': row[14],  # 卡券备注信息
-                        'card_delay_seconds': row[15] or 0  # 延时秒数
+                        'card_delay_seconds': row[15] or 0,  # 延时秒数
+                        'match_type': 'keyword'  # 关键字匹配的规则
                     })
 
                 return rules
@@ -4370,6 +4471,7 @@ Cookie数量: {cookie_count}
                     self._execute_sql(cursor, '''
                     SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
                            dr.description, dr.delivery_times, dr.created_at, dr.updated_at,
+                           dr.match_type, dr.item_id,
                            c.name as card_name, c.type as card_type,
                            c.is_multi_spec, c.spec_name, c.spec_value,
                            c.spec_name_2, c.spec_value_2
@@ -4381,6 +4483,7 @@ Cookie数量: {cookie_count}
                     self._execute_sql(cursor, '''
                     SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
                            dr.description, dr.delivery_times, dr.created_at, dr.updated_at,
+                           dr.match_type, dr.item_id,
                            c.name as card_name, c.type as card_type,
                            c.is_multi_spec, c.spec_name, c.spec_value,
                            c.spec_name_2, c.spec_value_2
@@ -4401,13 +4504,15 @@ Cookie数量: {cookie_count}
                         'delivery_times': row[6],
                         'created_at': row[7],
                         'updated_at': row[8],
-                        'card_name': row[9],
-                        'card_type': row[10],
-                        'is_multi_spec': bool(row[11]) if row[11] is not None else False,
-                        'spec_name': row[12],
-                        'spec_value': row[13],
-                        'spec_name_2': row[14],
-                        'spec_value_2': row[15]
+                        'match_type': row[9] or 'keyword',
+                        'item_id': row[10],
+                        'card_name': row[11],
+                        'card_type': row[12],
+                        'is_multi_spec': bool(row[13]) if row[13] is not None else False,
+                        'spec_name': row[14],
+                        'spec_value': row[15],
+                        'spec_name_2': row[16],
+                        'spec_value_2': row[17]
                     }
                 return None
             except Exception as e:
@@ -4416,8 +4521,21 @@ Cookie数量: {cookie_count}
 
     def update_delivery_rule(self, rule_id: int, keyword: str = None, card_id: int = None,
                            delivery_count: int = None, enabled: bool = None,
-                           description: str = None, user_id: int = None):
-        """更新发货规则（支持用户隔离）"""
+                           description: str = None, user_id: int = None,
+                           match_type: str = None, item_id: str = None):
+        """更新发货规则（支持用户隔离）
+
+        Args:
+            rule_id: 规则ID
+            keyword: 商品关键字
+            card_id: 卡券ID
+            delivery_count: 发货数量
+            enabled: 是否启用
+            description: 备注说明
+            user_id: 用户ID
+            match_type: 匹配类型，'keyword' 或 'item_id'
+            item_id: 商品ID
+        """
         with self.lock:
             try:
                 cursor = self.conn.cursor()
@@ -4441,6 +4559,12 @@ Cookie数量: {cookie_count}
                 if description is not None:
                     update_fields.append("description = ?")
                     params.append(description)
+                if match_type is not None:
+                    update_fields.append("match_type = ?")
+                    params.append(match_type)
+                if item_id is not None:
+                    update_fields.append("item_id = ?")
+                    params.append(item_id)
 
                 if not update_fields:
                     return True  # 没有需要更新的字段

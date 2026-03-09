@@ -3838,9 +3838,24 @@
         <div class="modal-body">
           <form id="addDeliveryRuleForm">
             <div class="mb-3">
+              <label class="form-label">匹配类型</label>
+              <select class="form-select" id="matchType" onchange="toggleMatchTypeFields()">
+                <option value="keyword">关键字匹配</option>
+                <option value="item_id">商品ID匹配</option>
+              </select>
+              <small class="form-text text-muted">关键字匹配：根据商品标题包含的关键字触发；商品ID匹配：精确匹配指定商品</small>
+            </div>
+            <div class="mb-3" id="keywordField">
               <label class="form-label">商品关键字 <span class="text-danger">*</span></label>
-              <input type="text" class="form-control" id="productKeyword" placeholder="例如：游戏点卡、会员卡等" required>
+              <input type="text" class="form-control" id="productKeyword" placeholder="例如：游戏点卡、会员卡等">
               <small class="form-text text-muted">当商品标题包含此关键字时触发自动发货</small>
+            </div>
+            <div class="mb-3" id="itemSelectField" style="display:none;">
+              <label class="form-label">选择商品 <span class="text-danger">*</span></label>
+              <select class="form-select" id="selectedItem">
+                <option value="">请选择商品</option>
+              </select>
+              <small class="form-text text-muted">选择要匹配的商品，实现精确发货</small>
             </div>
             <div class="mb-3">
               <label class="form-label">匹配卡券 <span class="text-danger">*</span></label>
@@ -3887,9 +3902,24 @@
           <form id="editDeliveryRuleForm">
             <input type="hidden" id="editRuleId">
             <div class="mb-3">
+              <label class="form-label">匹配类型</label>
+              <select class="form-select" id="editMatchType" onchange="toggleEditMatchTypeFields()">
+                <option value="keyword">关键字匹配</option>
+                <option value="item_id">商品ID匹配</option>
+              </select>
+              <small class="form-text text-muted">关键字匹配：根据商品标题包含的关键字触发；商品ID匹配：精确匹配指定商品</small>
+            </div>
+            <div class="mb-3" id="editKeywordField">
               <label class="form-label">商品关键字 <span class="text-danger">*</span></label>
-              <input type="text" class="form-control" id="editProductKeyword" required>
+              <input type="text" class="form-control" id="editProductKeyword">
               <small class="form-text text-muted">当商品标题包含此关键字时触发自动发货</small>
+            </div>
+            <div class="mb-3" id="editItemSelectField" style="display:none;">
+              <label class="form-label">选择商品 <span class="text-danger">*</span></label>
+              <select class="form-select" id="editSelectedItem">
+                <option value="">请选择商品</option>
+              </select>
+              <small class="form-text text-muted">选择要匹配的商品，实现精确发货</small>
             </div>
             <div class="mb-3">
               <label class="form-label">匹配卡券 <span class="text-danger">*</span></label>

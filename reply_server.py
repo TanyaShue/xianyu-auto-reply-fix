@@ -5732,7 +5732,9 @@ def create_delivery_rule(rule_data: dict, current_user: Dict[str, Any] = Depends
             delivery_count=rule_data.get('delivery_count', 1),
             enabled=rule_data.get('enabled', True),
             description=rule_data.get('description'),
-            user_id=user_id
+            user_id=user_id,
+            match_type=rule_data.get('match_type', 'keyword'),
+            item_id=rule_data.get('item_id')
         )
         return {"id": rule_id, "message": "发货规则创建成功"}
     except Exception as e:
@@ -5767,7 +5769,9 @@ def update_delivery_rule(rule_id: int, rule_data: dict, current_user: Dict[str, 
             delivery_count=rule_data.get('delivery_count', 1),
             enabled=rule_data.get('enabled', True),
             description=rule_data.get('description'),
-            user_id=user_id
+            user_id=user_id,
+            match_type=rule_data.get('match_type'),
+            item_id=rule_data.get('item_id')
         )
         if success:
             return {"message": "发货规则更新成功"}
