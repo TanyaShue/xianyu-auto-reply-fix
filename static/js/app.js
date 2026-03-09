@@ -5579,12 +5579,31 @@ function renderMessageNotifications(accounts, notifications) {
     const tr = document.createElement('tr');
 
     let channelsList = '';
+    let enabledTypesList = '';
     if (accountNotifications.length > 0) {
         channelsList = accountNotifications.map(n =>
         `<span class="badge bg-${n.enabled ? 'success' : 'secondary'} me-1">${n.channel_name}</span>`
         ).join('');
+
+        // 显示已启用的通知类型
+        const firstNotification = accountNotifications[0];
+        const enabledTypes = [];
+        if (firstNotification.enabled_message !== false) enabledTypes.push('消息');
+        if (firstNotification.enabled_token_refresh !== false) enabledTypes.push('Token异常');
+        if (firstNotification.enabled_delivery !== false) enabledTypes.push('发货');
+        if (firstNotification.enabled_slider_success !== false) enabledTypes.push('滑块');
+        if (firstNotification.enabled_face_verify !== false) enabledTypes.push('人脸');
+        if (firstNotification.enabled_password_login !== false) enabledTypes.push('登录');
+        if (firstNotification.enabled_cookie_refresh !== false) enabledTypes.push('刷新');
+
+        if (enabledTypes.length > 0) {
+        enabledTypesList = enabledTypes.map(t => `<span class="badge bg-info me-1">${t}</span>`).join('');
+        } else {
+        enabledTypesList = '<span class="text-muted">无</span>';
+        }
     } else {
         channelsList = '<span class="text-muted">未配置</span>';
+        enabledTypesList = '<span class="text-muted">-</span>';
     }
 
     const status = accountNotifications.some(n => n.enabled) ?
@@ -5594,6 +5613,7 @@ function renderMessageNotifications(accounts, notifications) {
     tr.innerHTML = `
         <td><strong class="text-primary">${accountId}</strong></td>
         <td>${channelsList}</td>
+        <td>${enabledTypesList}</td>
         <td>${status}</td>
         <td>
         <div class="btn-group" role="group">
@@ -5673,6 +5693,22 @@ async function configAccountNotification(accountId) {
     document.getElementById('notificationEnabled').checked =
         currentNotification ? currentNotification.enabled : true;
 
+    // 设置各种通知类型开关状态
+    document.getElementById('enabledMessage').checked =
+        currentNotification ? (currentNotification.enabled_message !== false) : true;
+    document.getElementById('enabledTokenRefresh').checked =
+        currentNotification ? (currentNotification.enabled_token_refresh !== false) : true;
+    document.getElementById('enabledDelivery').checked =
+        currentNotification ? (currentNotification.enabled_delivery !== false) : true;
+    document.getElementById('enabledSliderSuccess').checked =
+        currentNotification ? (currentNotification.enabled_slider_success !== false) : true;
+    document.getElementById('enabledFaceVerify').checked =
+        currentNotification ? (currentNotification.enabled_face_verify !== false) : true;
+    document.getElementById('enabledPasswordLogin').checked =
+        currentNotification ? (currentNotification.enabled_password_login !== false) : true;
+    document.getElementById('enabledCookieRefresh').checked =
+        currentNotification ? (currentNotification.enabled_cookie_refresh !== false) : true;
+
     // 显示配置模态框
     const modal = new bootstrap.Modal(document.getElementById('configNotificationModal'));
     modal.show();
@@ -5715,6 +5751,15 @@ async function saveAccountNotification() {
     const channelId = document.getElementById('notificationChannel').value;
     const enabled = document.getElementById('notificationEnabled').checked;
 
+    // 获取各种通知类型开关状态
+    const enabledMessage = document.getElementById('enabledMessage').checked;
+    const enabledTokenRefresh = document.getElementById('enabledTokenRefresh').checked;
+    const enabledDelivery = document.getElementById('enabledDelivery').checked;
+    const enabledSliderSuccess = document.getElementById('enabledSliderSuccess').checked;
+    const enabledFaceVerify = document.getElementById('enabledFaceVerify').checked;
+    const enabledPasswordLogin = document.getElementById('enabledPasswordLogin').checked;
+    const enabledCookieRefresh = document.getElementById('enabledCookieRefresh').checked;
+
     if (!channelId) {
     showToast('请选择通知渠道', 'warning');
     return;
@@ -5729,7 +5774,14 @@ async function saveAccountNotification() {
         },
         body: JSON.stringify({
         channel_id: parseInt(channelId),
-        enabled: enabled
+        enabled: enabled,
+        enabled_message: enabledMessage,
+        enabled_token_refresh: enabledTokenRefresh,
+        enabled_delivery: enabledDelivery,
+        enabled_slider_success: enabledSliderSuccess,
+        enabled_face_verify: enabledFaceVerify,
+        enabled_password_login: enabledPasswordLogin,
+        enabled_cookie_refresh: enabledCookieRefresh
         })
     });
 

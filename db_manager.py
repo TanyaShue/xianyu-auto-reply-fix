@@ -696,6 +696,9 @@ Cookie数量: {cookie_count}
             # 迁移notification_templates表以支持新的模板类型
             self._migrate_notification_templates(cursor)
 
+            # 迁移message_notifications表以支持通知类型开关
+            self._migrate_notification_type_switches(cursor)
+
             # 检查ai_reply_settings表是否存在api_type列
             cursor.execute("PRAGMA table_info(ai_reply_settings)")
             ai_columns = [column[1] for column in cursor.fetchall()]
@@ -857,7 +860,40 @@ Cookie数量: {cookie_count}
             try:
                 cursor.execute("DROP TABLE IF EXISTS notification_templates_new")
             except:
-                pass
+                               pass
+
+    def _migrate_notification_type_switches(self, cursor):
+        """迁移message_notifications表以支持通知类型开关"""
+        try:
+            # 检查表是否存在
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='message_notifications'")
+            if cursor.fetchone() is None:
+                logger.info("message_notifications表不存在，跳过迁移")
+                return
+
+            # 检查现有字段
+            cursor.execute("PRAGMA table_info(message_notifications)")
+            columns = [col[1] for col in cursor.fetchall()]
+
+            # 定义需要添加的通知类型开关字段
+            notification_type_fields = [
+                ('enabled_message', '消息通知'),
+                ('enabled_token_refresh', 'Token刷新异常'),
+                ('enabled_delivery', '自动发货'),
+                ('enabled_slider_success', '滑块验证成功'),
+                ('enabled_face_verify', '人脸验证'),
+                ('enabled_password_login', '密码登录成功'),
+                ('enabled_cookie_refresh', '刷新Cookie成功')
+            ]
+
+            for col_name, display_name in notification_type_fields:
+                if col_name not in columns:
+                    logger.info(f"添加通知类型开关字段: {col_name}")
+                    cursor.execute(f"ALTER TABLE message_notifications ADD COLUMN {col_name} BOOLEAN DEFAULT 1")
+
+            logger.info("通知类型开关字段迁移完成")
+        except Exception as e:
+            logger.error(f"迁移通知类型开关字段失败: {e}")
 
     def check_and_upgrade_db(self, cursor):
         """检查数据库版本并执行必要的升级"""
@@ -2947,15 +2983,24 @@ Cookie数量: {cookie_count}
                 return False
 
     # -------------------- 消息通知配置操作 --------------------
-    def set_message_notification(self, cookie_id: str, channel_id: int, enabled: bool = True) -> bool:
-        """设置账号的消息通知"""
+    def set_message_notification(self, cookie_id: str, channel_id: int, enabled: bool = True,
+                                  enabled_message: bool = True, enabled_token_refresh: bool = True,
+                                  enabled_delivery: bool = True, enabled_slider_success: bool = True,
+                                  enabled_face_verify: bool = True, enabled_password_login: bool = True,
+                                  enabled_cookie_refresh: bool = True) -> bool:
+        """设置账号的消息通知，支持各种通知类型开关"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                INSERT OR REPLACE INTO message_notifications (cookie_id, channel_id, enabled)
-                VALUES (?, ?, ?)
-                ''', (cookie_id, channel_id, enabled))
+                INSERT OR REPLACE INTO message_notifications
+                (cookie_id, channel_id, enabled, enabled_message, enabled_token_refresh,
+                 enabled_delivery, enabled_slider_success, enabled_face_verify,
+                 enabled_password_login, enabled_cookie_refresh)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (cookie_id, channel_id, enabled, enabled_message, enabled_token_refresh,
+                      enabled_delivery, enabled_slider_success, enabled_face_verify,
+                      enabled_password_login, enabled_cookie_refresh))
                 self.conn.commit()
                 logger.debug(f"设置消息通知: {cookie_id} -> {channel_id}")
                 return True
@@ -2970,7 +3015,10 @@ Cookie数量: {cookie_count}
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT mn.id, mn.channel_id, mn.enabled, nc.name, nc.type, nc.config
+                SELECT mn.id, mn.channel_id, mn.enabled, nc.name, nc.type, nc.config,
+                       mn.enabled_message, mn.enabled_token_refresh, mn.enabled_delivery,
+                       mn.enabled_slider_success, mn.enabled_face_verify,
+                       mn.enabled_password_login, mn.enabled_cookie_refresh
                 FROM message_notifications mn
                 JOIN notification_channels nc ON mn.channel_id = nc.id
                 WHERE mn.cookie_id = ? AND nc.enabled = 1
@@ -2985,7 +3033,14 @@ Cookie数量: {cookie_count}
                         'enabled': bool(row[2]),
                         'channel_name': row[3],
                         'channel_type': row[4],
-                        'channel_config': row[5]
+                        'channel_config': row[5],
+                        'enabled_message': bool(row[6]) if row[6] is not None else True,
+                        'enabled_token_refresh': bool(row[7]) if row[7] is not None else True,
+                        'enabled_delivery': bool(row[8]) if row[8] is not None else True,
+                        'enabled_slider_success': bool(row[9]) if row[9] is not None else True,
+                        'enabled_face_verify': bool(row[10]) if row[10] is not None else True,
+                        'enabled_password_login': bool(row[11]) if row[11] is not None else True,
+                        'enabled_cookie_refresh': bool(row[12]) if row[12] is not None else True
                     })
 
                 return notifications
@@ -2999,7 +3054,10 @@ Cookie数量: {cookie_count}
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT mn.cookie_id, mn.id, mn.channel_id, mn.enabled, nc.name, nc.type, nc.config
+                SELECT mn.cookie_id, mn.id, mn.channel_id, mn.enabled, nc.name, nc.type, nc.config,
+                       mn.enabled_message, mn.enabled_token_refresh, mn.enabled_delivery,
+                       mn.enabled_slider_success, mn.enabled_face_verify,
+                       mn.enabled_password_login, mn.enabled_cookie_refresh
                 FROM message_notifications mn
                 JOIN notification_channels nc ON mn.channel_id = nc.id
                 WHERE nc.enabled = 1
@@ -3018,7 +3076,14 @@ Cookie数量: {cookie_count}
                         'enabled': bool(row[3]),
                         'channel_name': row[4],
                         'channel_type': row[5],
-                        'channel_config': row[6]
+                        'channel_config': row[6],
+                        'enabled_message': bool(row[7]) if row[7] is not None else True,
+                        'enabled_token_refresh': bool(row[8]) if row[8] is not None else True,
+                        'enabled_delivery': bool(row[9]) if row[9] is not None else True,
+                        'enabled_slider_success': bool(row[10]) if row[10] is not None else True,
+                        'enabled_face_verify': bool(row[11]) if row[11] is not None else True,
+                        'enabled_password_login': bool(row[12]) if row[12] is not None else True,
+                        'enabled_cookie_refresh': bool(row[13]) if row[13] is not None else True
                     })
 
                 return result

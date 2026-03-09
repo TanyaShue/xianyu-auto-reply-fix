@@ -1928,6 +1928,13 @@ class NotificationChannelUpdate(BaseModel):
 class MessageNotificationIn(BaseModel):
     channel_id: int
     enabled: bool = True
+    enabled_message: bool = True
+    enabled_token_refresh: bool = True
+    enabled_delivery: bool = True
+    enabled_slider_success: bool = True
+    enabled_face_verify: bool = True
+    enabled_password_login: bool = True
+    enabled_cookie_refresh: bool = True
 
 
 class SystemSettingIn(BaseModel):
@@ -3682,7 +3689,13 @@ def set_message_notification(cid: str, notification_data: MessageNotificationIn,
         if not channel:
             raise HTTPException(status_code=404, detail='通知渠道不存在')
 
-        success = db_manager.set_message_notification(cid, notification_data.channel_id, notification_data.enabled)
+        success = db_manager.set_message_notification(
+            cid, notification_data.channel_id, notification_data.enabled,
+            notification_data.enabled_message, notification_data.enabled_token_refresh,
+            notification_data.enabled_delivery, notification_data.enabled_slider_success,
+            notification_data.enabled_face_verify, notification_data.enabled_password_login,
+            notification_data.enabled_cookie_refresh
+        )
         if success:
             return {'msg': 'message notification set'}
         else:

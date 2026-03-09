@@ -1878,10 +1878,11 @@
               <table class="table table-hover" id="notificationsTable">
                 <thead>
                   <tr>
-                    <th style="width: 20%">账号ID</th>
-                    <th style="width: 30%">通知渠道</th>
-                    <th style="width: 15%">状态</th>
-                    <th style="width: 35%">操作</th>
+                    <th style="width: 15%">账号ID</th>
+                    <th style="width: 20%">通知渠道</th>
+                    <th style="width: 25%">通知类型</th>
+                    <th style="width: 10%">状态</th>
+                    <th style="width: 30%">操作</th>
                   </tr>
                 </thead>
                 <tbody id="notificationsTableBody">
@@ -3148,8 +3149,57 @@
               <div class="form-check">
                 <input class="form-check-input" type="checkbox" id="notificationEnabled" checked>
                 <label class="form-check-label" for="notificationEnabled">
-                  启用消息通知
+                  启用通知渠道
                 </label>
+              </div>
+            </div>
+            <hr>
+            <div class="mb-2">
+              <label class="form-label"><i class="bi bi-sliders me-1"></i>通知类型开关</label>
+              <small class="form-text text-muted d-block mb-2">选择要接收的通知类型</small>
+            </div>
+            <div class="row">
+              <div class="col-md-6 mb-2">
+                <div class="form-check">
+                  <input class="form-check-input notification-type-switch" type="checkbox" id="enabledMessage" checked>
+                  <label class="form-check-label" for="enabledMessage">消息通知</label>
+                </div>
+              </div>
+              <div class="col-md-6 mb-2">
+                <div class="form-check">
+                  <input class="form-check-input notification-type-switch" type="checkbox" id="enabledTokenRefresh" checked>
+                  <label class="form-check-label" for="enabledTokenRefresh">Token刷新异常</label>
+                </div>
+              </div>
+              <div class="col-md-6 mb-2">
+                <div class="form-check">
+                  <input class="form-check-input notification-type-switch" type="checkbox" id="enabledDelivery" checked>
+                  <label class="form-check-label" for="enabledDelivery">自动发货</label>
+                </div>
+              </div>
+              <div class="col-md-6 mb-2">
+                <div class="form-check">
+                  <input class="form-check-input notification-type-switch" type="checkbox" id="enabledSliderSuccess" checked>
+                  <label class="form-check-label" for="enabledSliderSuccess">滑块验证成功</label>
+                </div>
+              </div>
+              <div class="col-md-6 mb-2">
+                <div class="form-check">
+                  <input class="form-check-input notification-type-switch" type="checkbox" id="enabledFaceVerify" checked>
+                  <label class="form-check-label" for="enabledFaceVerify">人脸验证</label>
+                </div>
+              </div>
+              <div class="col-md-6 mb-2">
+                <div class="form-check">
+                  <input class="form-check-input notification-type-switch" type="checkbox" id="enabledPasswordLogin" checked>
+                  <label class="form-check-label" for="enabledPasswordLogin">密码登录成功</label>
+                </div>
+              </div>
+              <div class="col-md-6 mb-2">
+                <div class="form-check">
+                  <input class="form-check-input notification-type-switch" type="checkbox" id="enabledCookieRefresh" checked>
+                  <label class="form-check-label" for="enabledCookieRefresh">刷新Cookie成功</label>
+                </div>
               </div>
             </div>
           </form>

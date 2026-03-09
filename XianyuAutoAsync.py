@@ -4765,6 +4765,11 @@ Cookie数量: {cookie_count}
                     logger.warning(f"📱 通知渠道 {notification.get('channel_name')} 已禁用，跳过")
                     continue
 
+                # 检查消息通知类型是否启用
+                if not notification.get('enabled_message', True):
+                    logger.warning(f"📱 消息通知类型已禁用，跳过")
+                    continue
+
                 channel_type = notification.get('channel_type')
                 channel_config = notification.get('channel_config')
 
@@ -5443,8 +5448,24 @@ Cookie数量: {cookie_count}
 
             # 发送通知到各个渠道
             notification_sent = False
+
+            # 根据通知类型确定要检查的开关字段
+            type_switch_map = {
+                'token_refresh': 'enabled_token_refresh',
+                'slider_success': 'enabled_slider_success',
+                'face_verify': 'enabled_face_verify',
+                'password_login_success': 'enabled_password_login',
+                'cookie_refresh_success': 'enabled_cookie_refresh'
+            }
+            switch_field = type_switch_map.get(notification_type, 'enabled_token_refresh')
+
             for notification in notifications:
                 if not notification.get('enabled', True):
+                    continue
+
+                # 检查对应通知类型是否启用
+                if not notification.get(switch_field, True):
+                    logger.debug(f"{notification_type} 通知类型已禁用，跳过")
                     continue
 
                 channel_type = notification.get('channel_type')
@@ -5604,6 +5625,11 @@ Cookie数量: {cookie_count}
             # 发送通知到所有已启用的通知渠道
             for notification in notifications:
                 if notification.get('enabled', False):
+                    # 检查自动发货通知类型是否启用
+                    if not notification.get('enabled_delivery', True):
+                        logger.debug(f"自动发货通知类型已禁用，跳过")
+                        continue
+
                     channel_type = notification.get('channel_type', 'qq')
                     channel_config = notification.get('channel_config', '')
 
