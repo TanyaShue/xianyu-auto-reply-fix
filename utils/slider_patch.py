@@ -256,23 +256,75 @@ def send_notification(user_id: str, title: str, message: str, notification_type:
 
                     elif channel_type == 'webhook':
                         # 自定义Webhook通知
-                        webhook_url = config_data.get('url', '')
+                        webhook_url = config_data.get('webhook_url') or config_data.get('url', '')
                         if webhook_url:
                             try:
-                                payload = {
+                                # 支持自定义HTTP方法
+                                http_method = config_data.get('http_method', 'POST').upper()
+
+                                # 构建默认payload
+                                timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+                                default_payload = {
                                     "title": title,
                                     "message": message,
                                     "user_id": user_id,
                                     "notification_type": notification_type,
-                                    "timestamp": time.strftime('%Y-%m-%d %H:%M:%S')
+                                    "timestamp": timestamp
                                 }
+
+                                # 支持自定义请求体模板
+                                body_template = config_data.get('body', '')
+                                if body_template and body_template.strip():
+                                    try:
+                                        # 对替换值进行JSON转义，处理换行符等特殊字符
+                                        title_escaped = json.dumps(title)[1:-1]
+                                        message_escaped = json.dumps(message)[1:-1]
+                                        user_id_escaped = json.dumps(user_id)[1:-1]
+                                        notification_type_escaped = json.dumps(notification_type)[1:-1]
+                                        timestamp_escaped = json.dumps(timestamp)[1:-1]
+
+                                        body_str = body_template
+                                        body_str = body_str.replace('{{title}}', title_escaped)
+                                        body_str = body_str.replace('{{message}}', message_escaped)
+                                        body_str = body_str.replace('{{user_id}}', user_id_escaped)
+                                        body_str = body_str.replace('{{notification_type}}', notification_type_escaped)
+                                        body_str = body_str.replace('{{timestamp}}', timestamp_escaped)
+                                        payload = json.loads(body_str)
+                                    except json.JSONDecodeError as e:
+                                        logger.warning(f"【{user_id}】Webhook请求体模板解析失败，使用默认格式: {e}")
+                                        payload = default_payload
+                                else:
+                                    payload = default_payload
+
+                                # 支持自定义请求头
+                                headers = {'Content-Type': 'application/json'}
+                                custom_headers = config_data.get('headers', '')
+                                if custom_headers and custom_headers.strip():
+                                    try:
+                                        parsed_headers = json.loads(custom_headers)
+                                        if isinstance(parsed_headers, dict):
+                                            headers.update(parsed_headers)
+                                    except json.JSONDecodeError as e:
+                                        logger.warning(f"【{user_id}】Webhook请求头解析失败，使用默认请求头: {e}")
+
                                 async with aiohttp.ClientSession() as session:
-                                    async with session.post(webhook_url, json=payload, timeout=10) as resp:
-                                        if resp.status == 200:
-                                            logger.info(f"【{user_id}】Webhook通知发送成功 ({channel_name})")
-                                            notification_sent = True
-                                        else:
-                                            logger.error(f"【{user_id}】Webhook通知发送失败: HTTP {resp.status}")
+                                    logger.debug(f"【{user_id}】Webhook发送: url={webhook_url}, method={http_method}, payload={payload}")
+                                    if http_method == 'PUT':
+                                        async with session.put(webhook_url, json=payload, headers=headers, timeout=10) as resp:
+                                            resp_text = await resp.text()
+                                            if resp.status == 200:
+                                                logger.info(f"【{user_id}】Webhook通知发送成功 ({channel_name})")
+                                                notification_sent = True
+                                            else:
+                                                logger.error(f"【{user_id}】Webhook通知发送失败: HTTP {resp.status}, body={resp_text[:200]}")
+                                    else:  # 默认POST
+                                        async with session.post(webhook_url, json=payload, headers=headers, timeout=10) as resp:
+                                            resp_text = await resp.text()
+                                            if resp.status == 200:
+                                                logger.info(f"【{user_id}】Webhook通知发送成功 ({channel_name})")
+                                                notification_sent = True
+                                            else:
+                                                logger.error(f"【{user_id}】Webhook通知发送失败: HTTP {resp.status}, body={resp_text[:200]}")
                             except Exception as webhook_error:
                                 logger.error(f"【{user_id}】Webhook通知发送失败: {webhook_error}")
                         else:

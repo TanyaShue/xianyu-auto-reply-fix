@@ -3939,20 +3939,78 @@ async def test_notification_template(data: TestNotificationIn, current_user: Dic
                                     failed_channels.append(f"{channel_name} (HTTP {resp.status})")
 
                 elif channel_type == 'webhook':
-                    webhook_url = config_data.get('webhook_url', '')
+                    webhook_url = config_data.get('webhook_url') or config_data.get('url', '')
                     if webhook_url:
-                        payload = {
+                        # 支持自定义HTTP方法
+                        http_method = config_data.get('http_method', 'POST').upper()
+
+                        # 构建默认payload
+                        timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+                        default_payload = {
                             "title": "测试通知",
                             "content": template,
-                            "type": data.template_type
+                            "type": data.template_type,
+                            "timestamp": timestamp
                         }
+
+                        # 支持自定义请求体模板
+                        body_template = config_data.get('body', '')
+                        logger.info(f"body_template原始值: {repr(body_template)}")
+                        if body_template and body_template.strip():
+                            try:
+                                body_str = body_template
+                                # 对替换值进行JSON转义，处理换行符等特殊字符
+                                title_escaped = json.dumps('测试通知')[1:-1]  # 去掉两端的引号
+                                message_escaped = json.dumps(template)[1:-1]
+                                user_id_escaped = json.dumps('test_user')[1:-1]
+                                notification_type_escaped = json.dumps(data.template_type)[1:-1]
+                                timestamp_escaped = json.dumps(timestamp)[1:-1]
+
+                                body_str = body_str.replace('{{title}}', title_escaped)
+                                body_str = body_str.replace('{{message}}', message_escaped)
+                                body_str = body_str.replace('{{user_id}}', user_id_escaped)
+                                body_str = body_str.replace('{{notification_type}}', notification_type_escaped)
+                                body_str = body_str.replace('{{timestamp}}', timestamp_escaped)
+                                logger.info(f"替换后的body_str: {repr(body_str)}")
+                                payload = json.loads(body_str)
+                                logger.info(f"解析后的payload: {payload}")
+                            except json.JSONDecodeError as e:
+                                logger.warning(f"Body模板JSON解析失败: {e}, body_str={repr(body_str)}")
+                                payload = default_payload
+                        else:
+                            logger.info(f"body_template为空或只有空白字符")
+                            payload = default_payload
+
+                        # 支持自定义请求头
+                        headers = {'Content-Type': 'application/json'}
+                        custom_headers = config_data.get('headers', '')
+                        if custom_headers and custom_headers.strip():
+                            try:
+                                parsed_headers = json.loads(custom_headers)
+                                if isinstance(parsed_headers, dict):
+                                    headers.update(parsed_headers)
+                            except json.JSONDecodeError:
+                                pass
+
                         timeout = aiohttp.ClientTimeout(total=10)
+                        logger.info(f"Webhook发送: url={webhook_url}, method={http_method}, headers={headers}, payload={payload}")
                         async with aiohttp.ClientSession(timeout=timeout) as session:
-                            async with session.post(webhook_url, json=payload) as resp:
-                                if resp.status == 200:
-                                    success_channels.append(channel_name)
-                                else:
-                                    failed_channels.append(f"{channel_name} (HTTP {resp.status})")
+                            if http_method == 'PUT':
+                                async with session.put(webhook_url, json=payload, headers=headers) as resp:
+                                    resp_text = await resp.text()
+                                    logger.info(f"Webhook响应: status={resp.status}, body={resp_text}")
+                                    if resp.status == 200:
+                                        success_channels.append(channel_name)
+                                    else:
+                                        failed_channels.append(f"{channel_name} (HTTP {resp.status}: {resp_text[:200]})")
+                            else:  # 默认POST
+                                async with session.post(webhook_url, json=payload, headers=headers) as resp:
+                                    resp_text = await resp.text()
+                                    logger.info(f"Webhook响应: status={resp.status}, body={resp_text}")
+                                    if resp.status == 200:
+                                        success_channels.append(channel_name)
+                                    else:
+                                        failed_channels.append(f"{channel_name} (HTTP {resp.status}: {resp_text[:200]})")
 
                 elif channel_type == 'email':
                     failed_channels.append(f"{channel_name} (邮件测试暂不支持)")

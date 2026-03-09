@@ -4754,6 +4754,14 @@ const channelTypeConfigs = {
         placeholder: '{"Authorization": "Bearer token", "Content-Type": "application/json"}',
         required: false,
         help: 'JSON格式的自定义请求头'
+        },
+        {
+        id: 'body',
+        label: '请求体模板（可选）',
+        type: 'textarea',
+        placeholder: '{\n  "title": "{{title}}",\n  "message": "{{message}}",\n  "user_id": "{{user_id}}"\n}',
+        required: false,
+        help: 'JSON格式的请求体模板，支持变量: {{title}}, {{message}}, {{user_id}}, {{notification_type}}, {{timestamp}}'
         }
     ]
     },
