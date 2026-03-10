@@ -671,11 +671,6 @@
               </div>
             </div>
 
-            <!-- 搜索结果统计 -->
-            <div id="itemSearchStats" class="text-muted small" style="display: none;">
-              <i class="bi bi-search me-1"></i>
-              <span id="itemSearchStatsText"></span>
-            </div>
           </div>
         </div>
 
@@ -785,18 +780,13 @@
           <div class="card-body">
             <div class="row align-items-end">
               <div class="col-md-6">
-                <label for="itemCookieFilter" class="form-label">筛选账号</label>
+                <label for="itemReplayCookieFilter" class="form-label">筛选账号</label>
                 <select class="form-select" id="itemReplayCookieFilter" onchange="loadItemsReplayByCookie()">
                   <option value="">所有账号</option>
                 </select>
               </div>
               <div class="col-md-6">
                 <div class="d-flex justify-content-end align-items-end gap-2">
-                  <!-- 页码输入 -->
-                  <div class="d-flex align-items-center gap-2">
-                    <label for="pageNumber" class="form-label mb-0 text-nowrap">页码:</label>
-                    <input type="number" class="form-control" id="pageNumber" placeholder="页码" min="1" value="1" style="width: 80px;">
-                  </div>
                   <div class="d-flex gap-2">
                     <button class="btn btn-success" onclick="showItemReplayEdit()">
                       添加商品回复
@@ -815,7 +805,7 @@
         <div class="card">
           <div class="card-header d-flex justify-content-between align-items-center">
             <h5 class="mb-0">商品列表(用于设置商品的默认回复信息)</h5>
-            <button class="btn btn-sm btn-outline-danger" onclick="batchDeleteItemReplies()">
+            <button class="btn btn-sm btn-outline-danger" id="batchDeleteItemRepliesBtn" onclick="batchDeleteItemReplies()" disabled>
               <i class="bi bi-trash"></i> 批量删除
             </button>
           </div>
@@ -825,7 +815,7 @@
                 <thead>
                   <tr>
                     <th style="width: 5%">
-                      <input type="checkbox" id="selectAllItemReplay" onchange="toggleSelectAll(this)">
+                      <input type="checkbox" id="selectAllItemReplies" onchange="toggleSelectAllItemReplies(this)">
                     </th>
                     <th style="width: 12%">账号ID</th>
                     <th style="width: 12%">商品ID</th>
@@ -838,7 +828,7 @@
                 </thead>
                 <tbody id="itemReplaysTableBody">
                   <tr>
-                    <td colspan="5" class="text-center text-muted">加载中...</td>
+                    <td colspan="8" class="text-center text-muted">加载中...</td>
                   </tr>
                 </tbody>
               </table>
@@ -882,7 +872,7 @@
             </div>
 
             <div class="mb-3">
-              <label for="editReplyContent" class="form-label">商品回复内容 <span class="text-danger">*</span></label>
+              <label for="editItemReplyContent" class="form-label">商品回复内容 <span class="text-danger">*</span></label>
               <textarea class="form-control" id="editItemReplyContent" rows="10"
                         placeholder="请输入商品回复内容..."></textarea>
               <div class="form-text">
@@ -927,12 +917,13 @@
               <option value="">所有状态</option>
               <option value="processing">处理中</option>
               <option value="pending_payment">待付款</option>
-              <option value="pending_delivery">待发货</option>
+              <option value="pending_ship">待发货</option>
+              <option value="partial_success">部分发货</option>
+              <option value="partial_pending_finalize">部分待收尾</option>
               <option value="shipped">已发货</option>
-              <option value="success">交易成功</option>
+              <option value="completed">交易成功</option>
               <option value="refunding">退款中</option>
-              <option value="refunded">退款成功</option>
-              <option value="closed">交易关闭</option>
+              <option value="cancelled">交易关闭</option>
               <option value="unknown">未知</option>
             </select>
           </div>
@@ -3997,11 +3988,11 @@
         </div>
         <div class="modal-body">
           <form id="editDefaultReplyForm">
-            <input type="hidden" id="editAccountId" />
+            <input type="hidden" id="editDefaultReplyAccountId" />
 
             <div class="mb-3">
               <label class="form-label">账号ID</label>
-              <input type="text" class="form-control" id="editAccountIdDisplay" readonly />
+              <input type="text" class="form-control" id="editDefaultReplyAccountIdDisplay" readonly />
             </div>
 
             <div class="mb-3">
@@ -4550,13 +4541,13 @@
         <div class="modal-header">
           <h5 class="modal-title">
             <i class="bi bi-pencil-square me-2"></i>
-            编辑账号信息 - <span id="editAccountIdDisplay"></span>
+            编辑账号信息 - <span id="accountEditIdDisplay"></span>
           </h5>
           <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
         </div>
         <div class="modal-body">
           <form id="accountEditForm">
-            <input type="hidden" id="editAccountId">
+            <input type="hidden" id="accountEditId">
             
             <div class="mb-3">
               <label class="form-label">Cookie <span class="text-danger">*</span></label>

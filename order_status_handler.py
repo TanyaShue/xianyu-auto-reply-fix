@@ -34,8 +34,10 @@ class OrderStatusHandler:
     # 4. 退款中的订单可以设置为已完成（因为买家可能取消退款）
     # 5. 只有退款完成才设置为已关闭
     VALID_TRANSITIONS = {
-        'processing': ['pending_ship', 'shipped', 'completed', 'cancelled'],
-        'pending_ship': ['shipped', 'completed', 'cancelled', 'refunding'],  # 已付款，可以退款
+        'processing': ['pending_ship', 'partial_success', 'partial_pending_finalize', 'shipped', 'completed', 'cancelled'],
+        'pending_ship': ['partial_success', 'partial_pending_finalize', 'shipped', 'completed', 'cancelled', 'refunding'],  # 已付款，可以退款
+        'partial_success': ['partial_pending_finalize', 'shipped', 'completed', 'cancelled', 'refunding'],  # 部分已完成，可继续推进或退款
+        'partial_pending_finalize': ['partial_success', 'shipped', 'completed', 'cancelled', 'refunding'],  # 部分待收尾，可继续收尾后进入下一状态
         'shipped': ['completed', 'cancelled', 'refunding'],  # 已发货，可以退款
         'completed': ['cancelled', 'refunding'],  # 已完成，可以退款
         'refunding': ['completed', 'cancelled', 'refund_cancelled'],  # 退款中，可以完成（取消退款）、关闭（退款完成）或撤销
@@ -51,6 +53,8 @@ class OrderStatusHandler:
         self.status_mapping = {
             'processing': '处理中',     # 初始状态/基本信息阶段
             'pending_ship': '待发货',   # 已付款，等待发货
+            'partial_success': '部分发货',  # 多数量发货部分完成
+            'partial_pending_finalize': '部分待收尾',  # 多数量发货部分消息已发，待补收尾
             'shipped': '已发货',        # 发货确认后
             'completed': '已完成',      # 交易完成
             'refunding': '退款中',      # 退款中/退货中
@@ -188,13 +192,133 @@ class OrderStatusHandler:
         except Exception as e:
             logger.error(f"提取订单ID失败: {str(e)}")
             return None
+
+    def _build_message_hash(self, message: Any) -> Optional[int]:
+        """构建待处理消息的匹配哈希。"""
+        if message is None:
+            return None
+
+        try:
+            return hash(str(sorted(message.items()))) if isinstance(message, dict) else hash(str(message))
+        except Exception:
+            try:
+                return hash(json.dumps(message, ensure_ascii=False, sort_keys=True, default=str))
+            except Exception as e:
+                logger.warning(f"构建消息哈希失败: {e}")
+                return None
+
+    def _normalize_match_text(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+
+        normalized = str(value).strip()
+        if not normalized:
+            return None
+
+        if normalized.lower() in {'unknown', 'unknown_user', 'none', 'null'}:
+            return None
+
+        return normalized
+
+    def _normalize_item_match_value(self, value: Any) -> Optional[str]:
+        normalized = self._normalize_match_text(value)
+        if not normalized:
+            return None
+
+        if normalized.startswith('auto_'):
+            return None
+
+        return normalized
+
+    def _normalize_pending_match_context(self, message: dict = None, match_context: Dict[str, Any] = None) -> Dict[str, Any]:
+        raw_context = dict(match_context or {})
+        message_hash = raw_context.get('message_hash')
+        if message_hash is None and message is not None:
+            message_hash = self._build_message_hash(message)
+
+        sid = self._normalize_match_text(raw_context.get('sid'))
+        buyer_id = self._normalize_match_text(raw_context.get('buyer_id'))
+        item_id = self._normalize_item_match_value(raw_context.get('item_id'))
+
+        sid_prefix = sid.split('@')[0] if sid and '@' in sid else sid
+        if buyer_id and sid_prefix and buyer_id == sid_prefix:
+            buyer_id = None
+
+        return {
+            'message_hash': message_hash,
+            'sid': sid,
+            'buyer_id': buyer_id,
+            'item_id': item_id,
+            'has_strong_match_key': bool(sid and buyer_id and item_id),
+        }
+
+    def _format_pending_match_context(self, match_context: Dict[str, Any]) -> str:
+        context = match_context or {}
+        return (
+            f"hash={context.get('message_hash')}, "
+            f"sid={context.get('sid') or '-'}, "
+            f"buyer_id={context.get('buyer_id') or '-'}, "
+            f"item_id={context.get('item_id') or '-'}"
+        )
+
+    def _pending_message_matches_strong_key(self, pending_msg: Dict[str, Any], match_context: Dict[str, Any]) -> bool:
+        if not match_context.get('has_strong_match_key'):
+            return False
+
+        return (
+            pending_msg.get('sid') == match_context.get('sid') and
+            pending_msg.get('buyer_id') == match_context.get('buyer_id') and
+            pending_msg.get('item_id') == match_context.get('item_id')
+        )
+
+    def _select_pending_message_index(self, pending_messages: list, match_context: Dict[str, Any], queue_name: str):
+        if not pending_messages:
+            return None, 'empty'
+
+        message_hash = match_context.get('message_hash')
+        if message_hash is not None:
+            hash_candidates = [
+                i for i, msg in enumerate(pending_messages)
+                if msg.get('message_hash') == message_hash
+            ]
+            if len(hash_candidates) == 1:
+                return hash_candidates[0], 'message_hash'
+            if len(hash_candidates) > 1:
+                strong_candidates = [
+                    i for i in hash_candidates
+                    if self._pending_message_matches_strong_key(pending_messages[i], match_context)
+                ]
+                if len(strong_candidates) == 1:
+                    return strong_candidates[0], 'message_hash+strong_key'
+
+                logger.warning(
+                    f"{queue_name} 待处理队列出现多个 message_hash 候选，严格模式拒绝匹配: "
+                    f"candidates={len(hash_candidates)}, {self._format_pending_match_context(match_context)}"
+                )
+                return None, 'ambiguous_message_hash'
+
+        if match_context.get('has_strong_match_key'):
+            strong_candidates = [
+                i for i, msg in enumerate(pending_messages)
+                if self._pending_message_matches_strong_key(msg, match_context)
+            ]
+            if len(strong_candidates) == 1:
+                return strong_candidates[0], 'strong_key'
+            if len(strong_candidates) > 1:
+                logger.warning(
+                    f"{queue_name} 待处理队列出现多个强关联键候选，严格模式拒绝匹配: "
+                    f"candidates={len(strong_candidates)}, {self._format_pending_match_context(match_context)}"
+                )
+                return None, 'ambiguous_strong_key'
+
+        return None, 'miss'
     
     def update_order_status(self, order_id: str, new_status: str, cookie_id: str, context: str = "") -> bool:
         """更新订单状态到数据库
         
         Args:
             order_id: 订单ID
-            new_status: 新状态 (processing/pending_ship/shipped/completed/cancelled)
+            new_status: 新状态 (processing/pending_ship/partial_success/partial_pending_finalize/shipped/completed/cancelled)
             cookie_id: Cookie ID
             context: 上下文信息，用于日志记录
             
@@ -260,13 +384,23 @@ class OrderStatusHandler:
                 # 处理退款撤销的特殊逻辑
                 if new_status == 'refund_cancelled':
                     # 从历史记录中获取上一次状态
-                    previous_status = self._get_previous_status(order_id)
+                    previous_status = self._get_previous_status(order_id, current_status=current_status)
+                    if not previous_status:
+                        previous_status = db_manager.get_order_pre_refund_status(order_id)
                     if previous_status:
                         logger.info(f"🔄 退款撤销，回退到上一次状态: {previous_status}")
                         new_status = previous_status
                     else:
                         logger.warning(f"⚠️ 退款撤销但无法获取上一次状态，保持当前状态: {current_status}")
                         new_status = current_status
+
+                pre_refund_status_to_save = ...
+                clear_pre_refund_status = False
+                if new_status == 'refunding':
+                    if current_status and current_status not in ['refunding', 'refund_cancelled', 'unknown']:
+                        pre_refund_status_to_save = current_status
+                elif current_status == 'refunding' and new_status != 'refunding':
+                    clear_pre_refund_status = True
                 
                 # 更新订单状态（带重试机制）
                 success = False
@@ -276,7 +410,9 @@ class OrderStatusHandler:
                         success = db_manager.insert_or_update_order(
                             order_id=order_id,
                             order_status=new_status,
-                            cookie_id=cookie_id
+                            cookie_id=cookie_id,
+                            pre_refund_status=pre_refund_status_to_save,
+                            clear_pre_refund_status=clear_pre_refund_status
                         )
                         logger.info(f"✅ 订单状态更新成功: {order_id}")
                         break
@@ -291,6 +427,12 @@ class OrderStatusHandler:
                 if success:
                     # 记录状态历史（用于退款撤销时回退）
                     self._record_status_history(order_id, current_status, new_status, context)
+
+                    try:
+                        from order_event_hub import publish_order_update_event
+                        publish_order_update_event(order_id, source='order_status_handler')
+                    except Exception as publish_e:
+                        logger.warning(f"发布订单状态事件失败: order_id={order_id}, error={publish_e}")
                     
                     status_text = self.status_mapping.get(new_status, new_status)
                     if self.config.get('enable_status_logging', True):
@@ -321,7 +463,7 @@ class OrderStatusHandler:
             return True
         
         # 特殊规则：已付款的订单和已完成的订单不能回退到处理中
-        if new_status == 'processing' and current_status in ['pending_ship', 'shipped', 'completed', 'refunding', 'refund_cancelled']:
+        if new_status == 'processing' and current_status in ['pending_ship', 'partial_success', 'partial_pending_finalize', 'shipped', 'completed', 'refunding', 'refund_cancelled']:
             logger.warning(f"❌ 状态转换被拒绝：{current_status} -> {new_status} (已付款/已完成的订单不能回退到处理中)")
             return False
         
@@ -445,7 +587,7 @@ class OrderStatusHandler:
                 
                 logger.debug(f"📝 记录订单状态历史: {order_id} {from_status} -> {to_status}")
     
-    def _get_previous_status(self, order_id: str) -> Optional[str]:
+    def _get_previous_status(self, order_id: str, current_status: str = None) -> Optional[str]:
         """获取订单的上一次状态（用于退款撤销时回退）
         
         Args:
@@ -458,9 +600,20 @@ class OrderStatusHandler:
             if order_id not in self._order_status_history or not self._order_status_history[order_id]:
                 return None
             
-            # 获取最后一次状态变化的目标状态
-            last_entry = self._order_status_history[order_id][-1]
-            return last_entry['to_status']
+            history = self._order_status_history[order_id]
+
+            if current_status:
+                for entry in reversed(history):
+                    if entry.get('to_status') == current_status:
+                        previous_status = entry.get('from_status')
+                        if previous_status and previous_status != 'refund_cancelled':
+                            return previous_status
+
+            last_entry = history[-1]
+            fallback_status = last_entry.get('from_status') or last_entry.get('to_status')
+            if fallback_status == 'refund_cancelled':
+                return None
+            return fallback_status
     
     def _add_to_pending_updates(self, order_id: str, new_status: str, cookie_id: str, context: str):
         """添加到待处理更新队列
@@ -630,7 +783,8 @@ class OrderStatusHandler:
             if total_cleared > 0:
                 logger.info(f"内存清理完成，共清理了 {total_cleared} 个过期项目")
     
-    def handle_system_message(self, message: dict, send_message: str, cookie_id: str, msg_time: str) -> bool:
+    def handle_system_message(self, message: dict, send_message: str, cookie_id: str, msg_time: str,
+                              match_context: Dict[str, Any] = None) -> bool:
         """处理系统消息并更新订单状态
         
         Args:
@@ -693,6 +847,8 @@ class OrderStatusHandler:
                 if cookie_id not in self._pending_system_messages:
                     self._pending_system_messages[cookie_id] = []
                 
+                pending_match_context = self._normalize_pending_match_context(message=message, match_context=match_context)
+
                 self._pending_system_messages[cookie_id].append({
                     'message': message,
                     'send_message': send_message,
@@ -700,9 +856,16 @@ class OrderStatusHandler:
                     'msg_time': msg_time,
                     'new_status': new_status,
                     'temp_order_id': temp_order_id,
-                    'message_hash': hash(str(sorted(message.items()))) if isinstance(message, dict) else hash(str(message)),  # 添加消息哈希用于匹配
+                    'message_hash': pending_match_context.get('message_hash'),
+                    'sid': pending_match_context.get('sid'),
+                    'buyer_id': pending_match_context.get('buyer_id'),
+                    'item_id': pending_match_context.get('item_id'),
                     'timestamp': time.time()  # 添加时间戳用于清理
                 })
+                logger.info(
+                    f"[{msg_time}] 【{cookie_id}】{send_message} 已进入严格待处理队列: "
+                    f"{self._format_pending_match_context(pending_match_context)}"
+                )
                 
                 return True
             
@@ -720,17 +883,19 @@ class OrderStatusHandler:
                 status_priority = {
                     'processing': 1,      # 处理中
                     'pending_ship': 2,    # 待发货
-                    'shipped': 3,         # 已发货
-                    'completed': 4,       # 已完成
+                    'partial_success': 3,  # 部分发货
+                    'partial_pending_finalize': 3,  # 部分待收尾
+                    'shipped': 4,         # 已发货
+                    'completed': 5,       # 已完成
                     'refunding': 2,       # 退款中（与待发货同级）
-                    'cancelled': 5,       # 已取消（终态）
+                    'cancelled': 6,       # 已取消（终态）
                 }
                 
                 current_priority = status_priority.get(current_status, 0)
                 new_priority = status_priority.get(new_status, 0)
                 
                 # 如果新状态的优先级低于当前状态，且不是特殊状态（退款、取消），则忽略
-                if new_priority < current_priority and new_status not in ['refunding', 'cancelled']:
+                if new_priority < current_priority and new_status not in ['refunding', 'cancelled', 'refund_cancelled']:
                     logger.warning(f'[{msg_time}] 【{cookie_id}】{send_message}，订单 {order_id} 当前状态为 {current_status}，忽略回退到 {new_status}')
                     return True  # 返回True表示已处理，但实际上是忽略
             
@@ -754,7 +919,8 @@ class OrderStatusHandler:
             logger.error(f'[{msg_time}] 【{cookie_id}】处理系统消息订单状态更新时出错: {str(e)}')
             return False
     
-    def handle_red_reminder_message(self, message: dict, red_reminder: str, user_id: str, cookie_id: str, msg_time: str) -> bool:
+    def handle_red_reminder_message(self, message: dict, red_reminder: str, user_id: str, cookie_id: str, msg_time: str,
+                                    match_context: Dict[str, Any] = None) -> bool:
         """处理红色提醒消息并更新订单状态
         
         Args:
@@ -797,6 +963,8 @@ class OrderStatusHandler:
                 if cookie_id not in self._pending_red_reminder_messages:
                     self._pending_red_reminder_messages[cookie_id] = []
                 
+                pending_match_context = self._normalize_pending_match_context(message=message, match_context=match_context)
+
                 self._pending_red_reminder_messages[cookie_id].append({
                     'message': message,
                     'red_reminder': red_reminder,
@@ -805,9 +973,16 @@ class OrderStatusHandler:
                     'msg_time': msg_time,
                     'new_status': 'cancelled',
                     'temp_order_id': temp_order_id,
-                    'message_hash': hash(str(sorted(message.items()))) if isinstance(message, dict) else hash(str(message)),  # 添加消息哈希用于匹配
+                    'message_hash': pending_match_context.get('message_hash'),
+                    'sid': pending_match_context.get('sid'),
+                    'buyer_id': pending_match_context.get('buyer_id'),
+                    'item_id': pending_match_context.get('item_id'),
                     'timestamp': time.time()  # 添加时间戳用于清理
                 })
+                logger.info(
+                    f"[{msg_time}] 【{cookie_id}】交易关闭已进入严格待处理队列: "
+                    f"{self._format_pending_match_context(pending_match_context)}"
+                )
                 
                 return True
             
@@ -829,6 +1004,18 @@ class OrderStatusHandler:
         except Exception as e:
             logger.error(f'[{msg_time}] 【{cookie_id}】处理交易关闭订单状态更新时出错: {str(e)}')
             return False
+
+    def handle_red_reminder_order_status(self, red_reminder: str, message: dict, user_id: str, cookie_id: str, msg_time: str,
+                                         match_context: Dict[str, Any] = None) -> bool:
+        """兼容旧调用入口，统一委托到红色提醒状态处理逻辑。"""
+        return self.handle_red_reminder_message(
+            message=message,
+            red_reminder=red_reminder,
+            user_id=user_id,
+            cookie_id=cookie_id,
+            msg_time=msg_time,
+            match_context=match_context
+        )
     
     def handle_auto_delivery_order_status(self, order_id: str, cookie_id: str, context: str = "自动发货") -> bool:
         """处理自动发货时的订单状态更新
@@ -944,13 +1131,15 @@ class OrderStatusHandler:
         if processed_count > 0:
             logger.info(f"订单 {order_id} 共处理了 {processed_count} 个待处理状态更新")
     
-    def on_order_id_extracted(self, order_id: str, cookie_id: str, message: dict = None):
+    def on_order_id_extracted(self, order_id: str, cookie_id: str, message: dict = None,
+                              match_context: Dict[str, Any] = None):
         """当主程序成功提取到订单ID后调用此方法处理待处理的系统消息
         
         Args:
             order_id: 订单ID
             cookie_id: Cookie ID
             message: 原始消息（可选，用于匹配）
+            match_context: 结构化匹配键（message_hash/sid/buyer_id/item_id）
         """
         logger.info(f"🔄 订单状态处理器.on_order_id_extracted开始: order_id={order_id}, cookie_id={cookie_id}")
         
@@ -959,6 +1148,11 @@ class OrderStatusHandler:
             if not self.config.get('use_pending_queue', True):
                 logger.info(f"⏭️ 订单 {order_id} ID已提取，但未启用待处理队列，跳过处理")
                 return
+
+            normalized_match_context = self._normalize_pending_match_context(message=message, match_context=match_context)
+            logger.info(
+                f"🔗 订单 {order_id} 严格关联键: {self._format_pending_match_context(normalized_match_context)}"
+            )
             
             logger.info(f"✅ 待处理队列已启用，检查账号 {cookie_id} 的待处理系统消息")
             
@@ -966,23 +1160,17 @@ class OrderStatusHandler:
             if cookie_id in self._pending_system_messages and self._pending_system_messages[cookie_id]:
                 logger.info(f"📝 账号 {cookie_id} 有 {len(self._pending_system_messages[cookie_id])} 个待处理的系统消息")
                 pending_msg = None
-                
-                # 如果提供了消息，尝试匹配
-                if message:
-                    logger.info(f"🔍 尝试通过消息哈希匹配待处理的系统消息")
-                    message_hash = hash(str(sorted(message.items()))) if isinstance(message, dict) else hash(str(message))
-                    # 从后往前遍历，避免pop时索引变化问题
-                    for i in range(len(self._pending_system_messages[cookie_id]) - 1, -1, -1):
-                        msg = self._pending_system_messages[cookie_id][i]
-                        if msg.get('message_hash') == message_hash:
-                            pending_msg = self._pending_system_messages[cookie_id].pop(i)
-                            logger.info(f"✅ 通过消息哈希匹配到待处理的系统消息: {pending_msg['send_message']}")
-                            break
-                
-                # 如果没有匹配到，使用FIFO原则
-                if not pending_msg and self._pending_system_messages[cookie_id]:
-                    pending_msg = self._pending_system_messages[cookie_id].pop(0)
-                    logger.info(f"✅ 使用FIFO原则处理待处理的系统消息: {pending_msg['send_message']}")
+                matched_index, match_mode = self._select_pending_message_index(
+                    self._pending_system_messages[cookie_id],
+                    normalized_match_context,
+                    '系统消息'
+                )
+                if matched_index is not None:
+                    pending_msg = self._pending_system_messages[cookie_id].pop(matched_index)
+                    logger.info(
+                        f"✅ 严格匹配到待处理的系统消息: {pending_msg['send_message']} "
+                        f"(mode={match_mode}, {self._format_pending_match_context(normalized_match_context)})"
+                    )
                 
                 if pending_msg:
                     logger.info(f"🔄 开始处理待处理的系统消息: {pending_msg['send_message']}")
@@ -1012,29 +1200,27 @@ class OrderStatusHandler:
                         del self._pending_system_messages[cookie_id]
                         logger.info(f"🗑️ 账号 {cookie_id} 的待处理系统消息队列已清空")
                 else:
-                    logger.info(f"ℹ️ 订单 {order_id} ID已提取，但没有找到对应的待处理系统消息")
+                    logger.info(
+                        f"ℹ️ 订单 {order_id} ID已提取，但严格关联未命中待处理系统消息，保留队列等待后续命中: "
+                        f"mode={match_mode}, {self._format_pending_match_context(normalized_match_context)}"
+                    )
             else:
                 logger.info(f"ℹ️ 账号 {cookie_id} 没有待处理的系统消息")
             
             # 处理待处理的红色提醒消息队列
             if cookie_id in self._pending_red_reminder_messages and self._pending_red_reminder_messages[cookie_id]:
                 pending_msg = None
-                
-                # 如果提供了消息，尝试匹配
-                if message:
-                    message_hash = hash(str(sorted(message.items()))) if isinstance(message, dict) else hash(str(message))
-                    # 从后往前遍历，避免pop时索引变化问题
-                    for i in range(len(self._pending_red_reminder_messages[cookie_id]) - 1, -1, -1):
-                        msg = self._pending_red_reminder_messages[cookie_id][i]
-                        if msg.get('message_hash') == message_hash:
-                            pending_msg = self._pending_red_reminder_messages[cookie_id].pop(i)
-                            logger.info(f"通过消息哈希匹配到待处理的红色提醒消息: {pending_msg['red_reminder']}")
-                            break
-                
-                # 如果没有匹配到，使用FIFO原则
-                if not pending_msg and self._pending_red_reminder_messages[cookie_id]:
-                    pending_msg = self._pending_red_reminder_messages[cookie_id].pop(0)
-                    logger.info(f"使用FIFO原则处理待处理的红色提醒消息: {pending_msg['red_reminder']}")
+                matched_index, match_mode = self._select_pending_message_index(
+                    self._pending_red_reminder_messages[cookie_id],
+                    normalized_match_context,
+                    '红色提醒'
+                )
+                if matched_index is not None:
+                    pending_msg = self._pending_red_reminder_messages[cookie_id].pop(matched_index)
+                    logger.info(
+                        f"✅ 严格匹配到待处理的红色提醒消息: {pending_msg['red_reminder']} "
+                        f"(mode={match_mode}, {self._format_pending_match_context(normalized_match_context)})"
+                    )
                 
                 if pending_msg:
                     logger.info(f"检测到订单 {order_id} ID已提取，开始处理待处理的红色提醒消息: {pending_msg['red_reminder']}")
@@ -1063,7 +1249,10 @@ class OrderStatusHandler:
                     if not self._pending_red_reminder_messages[cookie_id]:
                         del self._pending_red_reminder_messages[cookie_id]
                 else:
-                    logger.error(f"订单 {order_id} ID已提取，但没有找到对应的待处理红色提醒消息")
+                    logger.info(
+                        f"ℹ️ 订单 {order_id} ID已提取，但严格关联未命中待处理红色提醒消息，保留队列等待后续命中: "
+                        f"mode={match_mode}, {self._format_pending_match_context(normalized_match_context)}"
+                    )
 
 
 # 创建全局实例
