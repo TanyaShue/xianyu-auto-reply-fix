@@ -1985,6 +1985,9 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
         username = cookie_details.get('username', '') if cookie_details else ''
         password = cookie_details.get('password', '') if cookie_details else ''
 
+        # 获取账号状态
+        account_status = cookie_manager.manager.get_account_status(cookie_id)
+
         result.append({
             'id': cookie_id,
             'value': cookie_value,
@@ -1994,8 +1997,138 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
             'remark': remark,
             'username': username,
             'password': password,
-            'pause_duration': cookie_details.get('pause_duration', 10) if cookie_details else 10
+            'pause_duration': cookie_details.get('pause_duration', 10) if cookie_details else 10,
+            # 新增状态字段
+            'connection_state': account_status.get('connection_state', 'disconnected'),
+            'cookie_valid': account_status.get('cookie_valid'),
+            'last_check_time': account_status.get('last_check_time'),
+            'is_refreshing': account_status.get('is_refreshing', False),
+            'last_refresh_time': account_status.get('last_refresh_time')
         })
+    return result
+
+
+@app.get("/cookies/{cid}/status")
+def get_cookie_status_api(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """获取账号详细状态（连接状态、Cookie有效性等）"""
+    if cookie_manager.manager is None:
+        raise HTTPException(status_code=500, detail="CookieManager 未就绪")
+
+    # 检查cookie是否属于当前用户
+    user_id = current_user['user_id']
+    from db_manager import db_manager
+    user_cookies = db_manager.get_all_cookies(user_id)
+
+    if cid not in user_cookies:
+        raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+
+    # 获取账号状态
+    account_status = cookie_manager.manager.get_account_status(cid)
+
+    # 检查是否有正在运行的实例
+    live_instance = cookie_manager.manager.get_xianyu_instance(cid)
+    has_running_instance = live_instance is not None
+
+    # 获取任务状态
+    task_running = cid in cookie_manager.manager.tasks and not cookie_manager.manager.tasks[cid].done()
+
+    return {
+        'cookie_id': cid,
+        'connection_state': account_status.get('connection_state', 'disconnected'),
+        'cookie_valid': account_status.get('cookie_valid'),
+        'last_check_time': account_status.get('last_check_time'),
+        'error_message': account_status.get('error_message'),
+        'is_refreshing': account_status.get('is_refreshing', False),
+        'last_refresh_time': account_status.get('last_refresh_time'),
+        'has_running_instance': has_running_instance,
+        'task_running': task_running,
+        'enabled': cookie_manager.manager.get_cookie_status(cid)
+    }
+
+
+@app.post("/cookies/{cid}/check")
+async def check_cookie_validity_api(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """手动触发Cookie有效性检查"""
+    if cookie_manager.manager is None:
+        raise HTTPException(status_code=500, detail="CookieManager 未就绪")
+
+    # 检查cookie是否属于当前用户
+    user_id = current_user['user_id']
+    from db_manager import db_manager
+    user_cookies = db_manager.get_all_cookies(user_id)
+
+    if cid not in user_cookies:
+        raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+
+    # 检查是否正在刷新
+    if cookie_manager.manager.is_refreshing(cid):
+        return {
+            'cookie_id': cid,
+            'valid': None,
+            'error': 'Cookie正在刷新中，请稍后再试',
+            'check_time': int(time.time())
+        }
+
+    # 获取Cookie值
+    cookie_value = user_cookies.get(cid)
+    if not cookie_value:
+        return {
+            'cookie_id': cid,
+            'valid': False,
+            'error': 'Cookie值为空',
+            'check_time': int(time.time())
+        }
+
+    # 执行Cookie验证
+    try:
+        from utils.cookie_validator import check_cookie_validity
+        result = await check_cookie_validity(cookie_value, cid)
+
+        # 更新账号状态
+        cookie_manager.manager.update_cookie_validity(
+            cid,
+            valid=result['valid'],
+            error=result.get('error')
+        )
+
+        return {
+            'cookie_id': cid,
+            'valid': result['valid'],
+            'user_info': result.get('user_info'),
+            'error': result.get('error'),
+            'check_time': result['check_time']
+        }
+    except Exception as e:
+        logger.error(f"检查Cookie有效性失败: {cid} - {str(e)}")
+        return {
+            'cookie_id': cid,
+            'valid': False,
+            'error': f'检查失败: {str(e)[:50]}',
+            'check_time': int(time.time())
+        }
+
+
+@app.get("/cookies/status/all")
+def get_all_cookies_status(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """获取所有账号的状态概览"""
+    if cookie_manager.manager is None:
+        return {}
+
+    # 获取当前用户的cookies
+    user_id = current_user['user_id']
+    from db_manager import db_manager
+    user_cookies = db_manager.get_all_cookies(user_id)
+
+    result = {}
+    for cookie_id in user_cookies.keys():
+        account_status = cookie_manager.manager.get_account_status(cookie_id)
+        result[cookie_id] = {
+            'connection_state': account_status.get('connection_state', 'disconnected'),
+            'cookie_valid': account_status.get('cookie_valid'),
+            'is_refreshing': account_status.get('is_refreshing', False),
+            'enabled': cookie_manager.manager.get_cookie_status(cookie_id)
+        }
+
     return result
 
 

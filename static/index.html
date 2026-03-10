@@ -600,23 +600,37 @@
               <table class="table table-hover text-center" id="cookieTable">
                 <thead>
                   <tr>
-                    <th style="width: 8%">账号ID</th>
-                    <th style="width: 11%">Cookie值</th>
-                    <th style="width: 6%">关键词</th>
-                    <th style="width: 6%">状态</th>
-                    <th style="width: 7%">默认回复</th>
-                    <th style="width: 6%">AI回复</th>
-                    <th style="width: 9%">自动确认发货</th>
-                    <th style="width: 7%">自动好评</th>
-                    <th style="width: 11%">备注</th>
-                    <th style="width: 11%; white-space: nowrap;">
+                    <th style="width: 7%">账号ID</th>
+                    <th style="width: 8%">Cookie值</th>
+                    <th style="width: 5%">关键词</th>
+                    <th style="width: 5%">状态</th>
+                    <th style="width: 7%">
+                      连接状态
+                      <i class="bi bi-question-circle ms-1"
+                         data-bs-toggle="tooltip"
+                         data-bs-placement="top"
+                         title="WebSocket连接状态：已连接表示可正常接收消息"></i>
+                    </th>
+                    <th style="width: 7%">
+                      Cookie状态
+                      <i class="bi bi-question-circle ms-1"
+                         data-bs-toggle="tooltip"
+                         data-bs-placement="top"
+                         title="Cookie有效性：有效表示可正常调用API"></i>
+                    </th>
+                    <th style="width: 6%">默认回复</th>
+                    <th style="width: 5%">AI回复</th>
+                    <th style="width: 8%">自动确认发货</th>
+                    <th style="width: 6%">自动好评</th>
+                    <th style="width: 8%">备注</th>
+                    <th style="width: 8%; white-space: nowrap;">
                       暂停时间
                       <i class="bi bi-question-circle ms-1"
                          data-bs-toggle="tooltip"
                          data-bs-placement="top"
                          title="检测到手动发出消息后，自动回复暂停的时间长度（分钟）。设置为0表示不暂停。如果在暂停期间再次手动发出消息，会重新开始计时。"></i>
                     </th>
-                    <th style="width: 18%">操作</th>
+                    <th style="width: 16%">操作</th>
                   </tr>
                 </thead>
                 <tbody></tbody>
@@ -2253,6 +2267,7 @@
             allow="microphone; camera; clipboard-read; clipboard-write"
             sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads"
           ></iframe>
+          <!-- 注意: allow-same-origin + allow-scripts 组合允许 iframe 内容逃离沙箱，但闲鱼网站需要这些权限才能正常工作 -->
         </div>
       </div>
     </div>
@@ -4750,9 +4765,9 @@
             <i class="bi bi-info-circle me-2"></i>
             <strong>提示：</strong>检测到滑块验证，请完成滑块验证后继续搜索。验证成功后将自动关闭此窗口。
           </div>
-          <iframe id="captchaIframe" 
-                  style="width: 100%; height: 600px; border: none;"
-                  sandbox="allow-same-origin allow-scripts allow-forms">
+          <iframe id="captchaIframe"
+                  style="width: 100%; height: 600px; border: none;">
+                  <!-- 同源 iframe，无需 sandbox 限制，避免 allow-scripts + allow-same-origin 安全警告 -->
           </iframe>
           <div id="captchaLoadingIndicator" class="text-center py-5">
             <div class="spinner-border text-primary mb-3" role="status">

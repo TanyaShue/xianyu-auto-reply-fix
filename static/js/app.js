@@ -2471,9 +2471,17 @@ async function loadCookies() {
 
         // 自动确认发货状态（默认开启）
         const autoConfirm = cookie.auto_confirm === undefined ? true : cookie.auto_confirm;
-        
+
         // 自动好评状态（默认关闭）
         const autoComment = cookie.auto_comment === undefined ? false : cookie.auto_comment;
+
+        // 连接状态标签
+        const connectionState = cookie.connection_state || 'disconnected';
+        const connectionBadge = getConnectionStateBadge(connectionState, cookie.is_refreshing);
+
+        // Cookie有效性标签
+        const cookieValid = cookie.cookie_valid;
+        const cookieValidBadge = getCookieValidBadge(cookieValid, cookie.is_refreshing);
 
         tr.innerHTML = `
         <td class="align-middle">
@@ -2482,25 +2490,31 @@ async function loadCookies() {
             </div>
         </td>
         <td class="align-middle">
-            <div class="cookie-value" title="点击复制Cookie" style="font-family: monospace; font-size: 0.875rem; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+            <div class="cookie-value" title="点击复制Cookie" style="font-family: monospace; font-size: 0.875rem; max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
             ${cookie.value || '未设置'}
             </div>
         </td>
         <td class="align-middle">
             <span class="badge ${cookie.keywordCount > 0 ? 'bg-success' : 'bg-secondary'}">
-            ${cookie.keywordCount} 个关键词
+            ${cookie.keywordCount} 个
             </span>
         </td>
         <td class="align-middle">
-            <div class="d-flex align-items-center gap-2">
-            <label class="status-toggle" title="${isEnabled ? '点击禁用' : '点击启用'}">
+            <div class="d-flex align-items-center gap-1">
+            <label class="status-toggle-sm" title="${isEnabled ? '点击禁用' : '点击启用'}">
                 <input type="checkbox" ${isEnabled ? 'checked' : ''} onchange="toggleAccountStatus('${cookie.id}', this.checked)">
                 <span class="status-slider"></span>
             </label>
-            <span class="status-badge ${isEnabled ? 'enabled' : 'disabled'}" title="${isEnabled ? '账号已启用' : '账号已禁用'}">
-                <i class="bi bi-${isEnabled ? 'check-circle-fill' : 'x-circle-fill'}"></i>
-            </span>
             </div>
+        </td>
+        <td class="align-middle" data-cookie-id="${cookie.id}" data-status-type="connection">
+            ${connectionBadge}
+        </td>
+        <td class="align-middle" data-cookie-id="${cookie.id}" data-status-type="cookie-valid">
+            ${cookieValidBadge}
+            <button class="btn-icon-xs ms-1" onclick="checkCookieValidity('${cookie.id}')" title="检查Cookie" ${cookie.is_refreshing ? 'disabled' : ''}>
+                <i class="bi bi-arrow-clockwise"></i>
+            </button>
         </td>
         <td class="align-middle">
             ${defaultReplyBadge}
@@ -2536,7 +2550,7 @@ async function loadCookies() {
         <td class="align-middle">
             <div class="remark-cell" data-cookie-id="${cookie.id}">
                 <span class="remark-display" onclick="editRemark('${cookie.id}', '${(cookie.remark || '').replace(/'/g, '&#39;')}')" title="点击编辑备注" style="cursor: pointer; color: #6c757d; font-size: 0.875rem;">
-                    ${cookie.remark || '<i class="bi bi-plus-circle text-muted"></i> 添加备注'}
+                    ${cookie.remark || '<i class="bi bi-plus-circle text-muted"></i> 添加'}
                 </span>
             </div>
         </td>
@@ -2592,10 +2606,182 @@ async function loadCookies() {
     // 重新初始化工具提示
     initTooltips();
 
+    // 启动账号状态定时刷新
+    startAccountStatusRefresh();
+
     } catch (err) {
     // 错误已在fetchJSON中处理
     } finally {
     toggleLoading(false);
+    }
+}
+
+// ================================
+// 账号状态相关功能
+// ================================
+
+// 状态刷新定时器
+let accountStatusRefreshTimer = null;
+const ACCOUNT_STATUS_REFRESH_INTERVAL = 30000; // 30秒刷新一次
+
+/**
+ * 获取连接状态标签
+ */
+function getConnectionStateBadge(state, isRefreshing) {
+    const stateMap = {
+        'connected': { text: '已连接', class: 'bg-success', icon: 'wifi' },
+        'connecting': { text: '连接中', class: 'bg-warning', icon: 'wifi-1' },
+        'reconnecting': { text: '重连中', class: 'bg-warning', icon: 'wifi-2' },
+        'disconnected': { text: '未连接', class: 'bg-secondary', icon: 'wifi-off' },
+        'failed': { text: '失败', class: 'bg-danger', icon: 'wifi-off' },
+        'closed': { text: '已关闭', class: 'bg-secondary', icon: 'wifi-off' }
+    };
+
+    const info = stateMap[state] || stateMap['disconnected'];
+
+    // 如果正在刷新，显示刷新图标
+    if (isRefreshing) {
+        return `<span class="badge bg-info"><i class="bi bi-arrow-repeat spin-animation"></i> 刷新中</span>`;
+    }
+
+    return `<span class="badge ${info.class}" title="WebSocket${info.text}"><i class="bi bi-${info.icon}"></i></span>`;
+}
+
+/**
+ * 获取Cookie有效性标签
+ */
+function getCookieValidBadge(valid, isRefreshing) {
+    // 如果正在刷新
+    if (isRefreshing) {
+        return `<span class="badge bg-info"><i class="bi bi-arrow-repeat spin-animation"></i></span>`;
+    }
+
+    // 如果未检查
+    if (valid === null || valid === undefined) {
+        return `<span class="badge bg-secondary" title="未检查"><i class="bi bi-question-circle"></i></span>`;
+    }
+
+    if (valid === true) {
+        return `<span class="badge bg-success" title="Cookie有效"><i class="bi bi-check-circle"></i> 有效</span>`;
+    }
+
+    return `<span class="badge bg-danger" title="Cookie已过期"><i class="bi bi-x-circle"></i> 过期</span>`;
+}
+
+/**
+ * 启动账号状态定时刷新
+ */
+function startAccountStatusRefresh() {
+    // 先清除旧的定时器
+    if (accountStatusRefreshTimer) {
+        clearInterval(accountStatusRefreshTimer);
+    }
+
+    // 启动新的定时器
+    accountStatusRefreshTimer = setInterval(async () => {
+        // 检查是否在账号管理页面
+        const accountsSection = document.getElementById('accounts-section');
+        if (!accountsSection || !accountsSection.classList.contains('active')) {
+            return; // 不在账号管理页面，不刷新
+        }
+
+        try {
+            // 获取所有账号状态
+            const response = await fetch(`${apiBase}/cookies/status/all`, {
+                headers: { 'Authorization': `Bearer ${authToken}` }
+            });
+
+            if (response.ok) {
+                const statusData = await response.json();
+                updateAccountStatusDisplay(statusData);
+            }
+        } catch (error) {
+            console.error('刷新账号状态失败:', error);
+        }
+    }, ACCOUNT_STATUS_REFRESH_INTERVAL);
+}
+
+/**
+ * 更新账号状态显示
+ */
+function updateAccountStatusDisplay(statusData) {
+    for (const [cookieId, status] of Object.entries(statusData)) {
+        // 更新连接状态
+        const connectionCell = document.querySelector(`td[data-cookie-id="${cookieId}"][data-status-type="connection"]`);
+        if (connectionCell) {
+            connectionCell.innerHTML = getConnectionStateBadge(status.connection_state, status.is_refreshing);
+        }
+
+        // 更新Cookie状态
+        const cookieValidCell = document.querySelector(`td[data-cookie-id="${cookieId}"][data-status-type="cookie-valid"]`);
+        if (cookieValidCell) {
+            const checkBtn = status.is_refreshing ? 'disabled' : '';
+            cookieValidCell.innerHTML = `
+                ${getCookieValidBadge(status.cookie_valid, status.is_refreshing)}
+                <button class="btn-icon-xs ms-1" onclick="checkCookieValidity('${cookieId}')" title="检查Cookie" ${checkBtn}>
+                    <i class="bi bi-arrow-clockwise"></i>
+                </button>
+            `;
+        }
+    }
+}
+
+/**
+ * 手动检查Cookie有效性
+ */
+async function checkCookieValidity(cookieId) {
+    try {
+        showToast(`正在检查账号 "${cookieId}" 的Cookie...`, 'info');
+
+        // 先显示检查中状态
+        const cookieValidCell = document.querySelector(`td[data-cookie-id="${cookieId}"][data-status-type="cookie-valid"]`);
+        if (cookieValidCell) {
+            cookieValidCell.innerHTML = `
+                <span class="badge bg-info"><i class="bi bi-arrow-repeat spin-animation"></i> 检查中</span>
+                <button class="btn btn-sm btn-outline-info ms-1" disabled>
+                    <i class="bi bi-arrow-clockwise"></i>
+                </button>
+            `;
+        }
+
+        const response = await fetch(`${apiBase}/cookies/${cookieId}/check`, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${authToken}` }
+        });
+
+        if (response.ok) {
+            const result = await response.json();
+
+            if (result.valid === true) {
+                showToast(`账号 "${cookieId}" Cookie有效`, 'success');
+                if (cookieValidCell) {
+                    cookieValidCell.innerHTML = `
+                        <span class="badge bg-success" title="Cookie有效"><i class="bi bi-check-circle"></i> 有效</span>
+                        <button class="btn-icon-xs ms-1" onclick="checkCookieValidity('${cookieId}')" title="检查Cookie">
+                            <i class="bi bi-arrow-clockwise"></i>
+                        </button>
+                    `;
+                }
+            } else if (result.valid === false) {
+                showToast(`账号 "${cookieId}" Cookie已过期: ${result.error || '未知错误'}`, 'error');
+                if (cookieValidCell) {
+                    cookieValidCell.innerHTML = `
+                        <span class="badge bg-danger" title="${result.error || 'Cookie已过期'}"><i class="bi bi-x-circle"></i> 过期</span>
+                        <button class="btn-icon-xs ms-1" onclick="checkCookieValidity('${cookieId}')" title="检查Cookie">
+                            <i class="bi bi-arrow-clockwise"></i>
+                        </button>
+                    `;
+                }
+            } else {
+                showToast(`账号 "${cookieId}" ${result.error || '检查中，请稍后再试'}`, 'warning');
+            }
+        } else {
+            const errorData = await response.json();
+            showToast(`检查失败: ${errorData.detail || '未知错误'}`, 'error');
+        }
+    } catch (error) {
+        console.error('检查Cookie有效性失败:', error);
+        showToast('检查Cookie有效性失败', 'error');
     }
 }
 

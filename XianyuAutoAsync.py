@@ -282,12 +282,12 @@ class XianyuLive:
             old_state = self.connection_state
             self.connection_state = new_state
             self.last_state_change_time = time.time()
-            
+
             # 记录状态转换
             state_msg = f"【{self.cookie_id}】连接状态: {old_state.value} → {new_state.value}"
             if reason:
                 state_msg += f" ({reason})"
-            
+
             # 根据状态严重程度选择日志级别
             if new_state == ConnectionState.FAILED:
                 logger.error(state_msg)
@@ -297,6 +297,14 @@ class XianyuLive:
                 logger.success(state_msg)
             else:
                 logger.info(state_msg)
+
+            # 更新cookie_manager中的账号状态
+            try:
+                from cookie_manager import manager as cookie_manager
+                if cookie_manager:
+                    cookie_manager.update_connection_state(self.cookie_id, new_state.value)
+            except Exception as e:
+                logger.debug(f"更新账号连接状态失败: {e}")
 
     async def _interruptible_sleep(self, duration: float):
         """可中断的sleep，将长时间sleep拆分成多个短时间sleep，以便及时响应取消信号
@@ -7238,83 +7246,118 @@ Cookie数量: {cookie_count}
     async def _execute_cookie_refresh(self, current_time):
         """独立执行Cookie刷新任务，避免阻塞主循环"""
 
-        # 使用Lock确保原子性，防止重复执行
-        async with self.cookie_refresh_lock:
-            try:
-                logger.info(f"【{self.cookie_id}】开始Cookie刷新任务，暂时暂停心跳以避免连接冲突...")
+        # 先尝试获取全局刷新锁，防止同一账号多个实例同时刷新
+        from cookie_manager import manager as cookie_manager
+        if cookie_manager:
+            if not await cookie_manager.acquire_refresh_lock(self.cookie_id):
+                logger.warning(f"【{self.cookie_id}】其他实例正在刷新Cookie，跳过本次刷新")
+                return
+            # 更新刷新状态
+            cookie_manager.update_account_status(self.cookie_id, is_refreshing=True)
 
-                # 暂时暂停心跳任务，避免与浏览器操作冲突
-                heartbeat_was_running = False
-                if self.heartbeat_task and not self.heartbeat_task.done():
-                    heartbeat_was_running = True
-                    self.heartbeat_task.cancel()
-                    logger.warning(f"【{self.cookie_id}】已暂停心跳任务")
+        try:
+            # 使用实例级Lock确保原子性，防止重复执行
+            async with self.cookie_refresh_lock:
+                try:
+                    logger.info(f"【{self.cookie_id}】开始Cookie刷新任务，暂时暂停心跳以避免连接冲突...")
 
-                # 为整个Cookie刷新任务添加超时保护（3分钟，缩短时间减少影响）
-                success = await asyncio.wait_for(
-                    self._refresh_cookies_via_browser(),
-                    timeout=180.0  # 3分钟超时，减少对WebSocket的影响
-                )
+                    # 暂时暂停心跳任务，避免与浏览器操作冲突
+                    heartbeat_was_running = False
+                    if self.heartbeat_task and not self.heartbeat_task.done():
+                        heartbeat_was_running = True
+                        self.heartbeat_task.cancel()
+                        logger.warning(f"【{self.cookie_id}】已暂停心跳任务")
 
-                # 重新启动心跳任务
-                if heartbeat_was_running and self.ws and not self.ws.closed:
-                    logger.warning(f"【{self.cookie_id}】重新启动心跳任务")
-                    self.heartbeat_task = asyncio.create_task(self.heartbeat_loop(self.ws))
+                    # 为整个Cookie刷新任务添加超时保护（3分钟，缩短时间减少影响）
+                    success = await asyncio.wait_for(
+                        self._refresh_cookies_via_browser(),
+                        timeout=180.0  # 3分钟超时，减少对WebSocket的影响
+                    )
 
-                if success:
-                    self.last_cookie_refresh_time = current_time
-                    logger.info(f"【{self.cookie_id}】Cookie刷新任务完成，心跳已恢复")
-                    
-                    # 刷新成功后，验证Cookie有效性
-                    logger.info(f"【{self.cookie_id}】开始验证刷新后的Cookie有效性...")
-                    try:
-                        validation_result = await self._verify_cookie_validity()
-                        
-                        if not validation_result['valid']:
-                            logger.warning(f"【{self.cookie_id}】❌ Cookie验证失败: {validation_result['details']}")
-                            logger.warning(f"【{self.cookie_id}】检测到Cookie可能无法用于关键API，尝试通过密码登录重新获取...")
-                            
-                            # 触发密码登录刷新
-                            password_refresh_success = await self._try_password_login_refresh("Cookie验证失败(关键API不可用)")
-                            
-                            if password_refresh_success:
-                                logger.info(f"【{self.cookie_id}】✅ 密码登录刷新成功，Cookie已更新")
+                    # 重新启动心跳任务
+                    if heartbeat_was_running and self.ws and not self.ws.closed:
+                        logger.warning(f"【{self.cookie_id}】重新启动心跳任务")
+                        self.heartbeat_task = asyncio.create_task(self.heartbeat_loop(self.ws))
+
+                    if success:
+                        self.last_cookie_refresh_time = current_time
+                        logger.info(f"【{self.cookie_id}】Cookie刷新任务完成，心跳已恢复")
+
+                        # 更新刷新时间到状态
+                        if cookie_manager:
+                            cookie_manager.update_account_status(
+                                self.cookie_id,
+                                last_refresh_time=int(time.time()),
+                                cookie_valid=True
+                            )
+
+                        # 刷新成功后，验证Cookie有效性
+                        logger.info(f"【{self.cookie_id}】开始验证刷新后的Cookie有效性...")
+                        try:
+                            validation_result = await self._verify_cookie_validity()
+
+                            if not validation_result['valid']:
+                                logger.warning(f"【{self.cookie_id}】❌ Cookie验证失败: {validation_result['details']}")
+                                logger.warning(f"【{self.cookie_id}】检测到Cookie可能无法用于关键API，尝试通过密码登录重新获取...")
+
+                                # 更新Cookie有效性状态
+                                if cookie_manager:
+                                    cookie_manager.update_cookie_validity(
+                                        self.cookie_id,
+                                        valid=False,
+                                        error=str(validation_result['details'])
+                                    )
+
+                                # 触发密码登录刷新
+                                password_refresh_success = await self._try_password_login_refresh("Cookie验证失败(关键API不可用)")
+
+                                if password_refresh_success:
+                                    logger.info(f"【{self.cookie_id}】✅ 密码登录刷新成功，Cookie已更新")
+                                    if cookie_manager:
+                                        cookie_manager.update_cookie_validity(self.cookie_id, valid=True)
+                                else:
+                                    logger.warning(f"【{self.cookie_id}】⚠️ 密码登录刷新失败，Cookie可能仍然无效")
+                                    # 发送通知
+                                    await self.send_token_refresh_notification(
+                                        f"Cookie验证失败且密码登录刷新也失败\n验证详情: {validation_result['details']}",
+                                        "cookie_validation_failed"
+                                    )
                             else:
-                                logger.warning(f"【{self.cookie_id}】⚠️ 密码登录刷新失败，Cookie可能仍然无效")
-                                # 发送通知
-                                await self.send_token_refresh_notification(
-                                    f"Cookie验证失败且密码登录刷新也失败\n验证详情: {validation_result['details']}",
-                                    "cookie_validation_failed"
-                                )
-                        else:
-                            logger.info(f"【{self.cookie_id}】✅ Cookie验证通过: {validation_result['details']}")
-                            
-                    except Exception as verify_e:
-                        logger.error(f"【{self.cookie_id}】Cookie验证过程异常: {self._safe_str(verify_e)}")
-                        import traceback
-                        logger.error(f"【{self.cookie_id}】详细堆栈:\n{traceback.format_exc()}")
-                else:
-                    logger.warning(f"【{self.cookie_id}】Cookie刷新任务失败")
-                    # 即使失败也要更新时间，避免频繁重试
+                                logger.info(f"【{self.cookie_id}】✅ Cookie验证通过: {validation_result['details']}")
+                                if cookie_manager:
+                                    cookie_manager.update_cookie_validity(self.cookie_id, valid=True)
+
+                        except Exception as verify_e:
+                            logger.error(f"【{self.cookie_id}】Cookie验证过程异常: {self._safe_str(verify_e)}")
+                            import traceback
+                            logger.error(f"【{self.cookie_id}】详细堆栈:\n{traceback.format_exc()}")
+                    else:
+                        logger.warning(f"【{self.cookie_id}】Cookie刷新任务失败")
+                        # 即使失败也要更新时间，避免频繁重试
+                        self.last_cookie_refresh_time = current_time
+
+                except asyncio.TimeoutError:
+                    # 超时也要更新时间，避免频繁重试
                     self.last_cookie_refresh_time = current_time
+                except Exception as e:
+                    logger.error(f"【{self.cookie_id}】执行Cookie刷新任务异常: {self._safe_str(e)}")
+                    # 异常也要更新时间，避免频繁重试
+                    self.last_cookie_refresh_time = current_time
+                finally:
+                    # 确保心跳任务恢复（如果WebSocket仍然连接）
+                    if (self.ws and not self.ws.closed and
+                        (not self.heartbeat_task or self.heartbeat_task.done())):
+                        logger.info(f"【{self.cookie_id}】Cookie刷新完成，心跳任务正常运行")
+                        self.heartbeat_task = asyncio.create_task(self.heartbeat_loop(self.ws))
 
-            except asyncio.TimeoutError:
-                # 超时也要更新时间，避免频繁重试
-                self.last_cookie_refresh_time = current_time
-            except Exception as e:
-                logger.error(f"【{self.cookie_id}】执行Cookie刷新任务异常: {self._safe_str(e)}")
-                # 异常也要更新时间，避免频繁重试
-                self.last_cookie_refresh_time = current_time
-            finally:
-                # 确保心跳任务恢复（如果WebSocket仍然连接）
-                if (self.ws and not self.ws.closed and
-                    (not self.heartbeat_task or self.heartbeat_task.done())):
-                    logger.info(f"【{self.cookie_id}】Cookie刷新完成，心跳任务正常运行")
-                    self.heartbeat_task = asyncio.create_task(self.heartbeat_loop(self.ws))
-
-                # 清空消息接收标志，允许下次正常执行Cookie刷新
-                self.last_message_received_time = 0
-                logger.warning(f"【{self.cookie_id}】Cookie刷新完成，已清空消息接收标志")
+                    # 清空消息接收标志，允许下次正常执行Cookie刷新
+                    self.last_message_received_time = 0
+                    logger.warning(f"【{self.cookie_id}】Cookie刷新完成，已清空消息接收标志")
+        finally:
+            # 释放全局刷新锁
+            if cookie_manager:
+                cookie_manager.release_refresh_lock(self.cookie_id)
+                cookie_manager.update_account_status(self.cookie_id, is_refreshing=False)
 
 
 

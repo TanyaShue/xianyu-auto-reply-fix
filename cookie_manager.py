@@ -1,6 +1,6 @@
 from __future__ import annotations
 import asyncio
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 from loguru import logger
 from db_manager import db_manager
 
@@ -19,6 +19,13 @@ class CookieManager:
         self.auto_confirm_settings: Dict[str, bool] = {}  # 自动确认发货设置
         self._task_locks: Dict[str, asyncio.Lock] = {}  # 每个cookie_id的任务锁，防止重复创建
         self.live_instances: Dict[str, Any] = {}  # 存储 XianyuLive 实例，供外部调用
+
+        # 全局Cookie刷新锁字典，确保同一账号只有一个刷新任务在执行
+        self._cookie_refresh_locks: Dict[str, asyncio.Lock] = {}
+
+        # 账号状态存储 {cookie_id: {connection_state, cookie_valid, last_check_time, ...}}
+        self.account_status: Dict[str, Dict] = {}
+
         self._load_from_db()
 
     def _load_from_db(self):
@@ -431,6 +438,121 @@ class CookieManager:
     def get_auto_confirm_setting(self, cookie_id: str) -> bool:
         """获取账号的自动确认发货设置"""
         return self.auto_confirm_settings.get(cookie_id, True)  # 默认开启
+
+    # ------------------------ 全局Cookie刷新锁管理 ------------------------
+    def _get_refresh_lock(self, cookie_id: str) -> asyncio.Lock:
+        """获取指定cookie_id的刷新锁（如果不存在则创建）"""
+        if cookie_id not in self._cookie_refresh_locks:
+            self._cookie_refresh_locks[cookie_id] = asyncio.Lock()
+        return self._cookie_refresh_locks[cookie_id]
+
+    async def acquire_refresh_lock(self, cookie_id: str) -> bool:
+        """尝试获取Cookie刷新锁
+
+        Args:
+            cookie_id: Cookie ID
+
+        Returns:
+            bool: 成功获取锁返回True，锁已被占用返回False
+        """
+        lock = self._get_refresh_lock(cookie_id)
+        if lock.locked():
+            return False
+        await lock.acquire()
+        return True
+
+    def release_refresh_lock(self, cookie_id: str):
+        """释放Cookie刷新锁"""
+        lock = self._cookie_refresh_locks.get(cookie_id)
+        if lock and lock.locked():
+            lock.release()
+            logger.debug(f"【{cookie_id}】已释放全局刷新锁")
+
+    def is_refreshing(self, cookie_id: str) -> bool:
+        """检查指定账号是否正在刷新Cookie"""
+        lock = self._cookie_refresh_locks.get(cookie_id)
+        return lock.locked() if lock else False
+
+    # ------------------------ 账号状态管理 ------------------------
+    def update_account_status(self, cookie_id: str, **kwargs):
+        """更新账号状态
+
+        Args:
+            cookie_id: Cookie ID
+            **kwargs: 状态字段（如connection_state, cookie_valid, error_message等）
+        """
+        if cookie_id not in self.account_status:
+            self.account_status[cookie_id] = {
+                'connection_state': 'disconnected',
+                'cookie_valid': None,
+                'last_check_time': None,
+                'error_message': None,
+                'last_refresh_time': None,
+                'is_refreshing': False
+            }
+
+        self.account_status[cookie_id].update(kwargs)
+
+        # 如果设置了is_refreshing，同步更新刷新锁状态
+        if 'is_refreshing' in kwargs:
+            logger.debug(f"【{cookie_id}】账号刷新状态更新: {kwargs['is_refreshing']}")
+
+    def get_account_status(self, cookie_id: str) -> Dict:
+        """获取账号状态
+
+        Args:
+            cookie_id: Cookie ID
+
+        Returns:
+            Dict: 账号状态信息
+        """
+        if cookie_id not in self.account_status:
+            # 返回默认状态
+            return {
+                'connection_state': 'disconnected',
+                'cookie_valid': None,
+                'last_check_time': None,
+                'error_message': None,
+                'last_refresh_time': None,
+                'is_refreshing': False
+            }
+        return self.account_status[cookie_id].copy()
+
+    def get_all_account_status(self) -> Dict[str, Dict]:
+        """获取所有账号状态
+
+        Returns:
+            Dict[str, Dict]: 所有账号的状态信息
+        """
+        result = {}
+        for cookie_id in self.cookies.keys():
+            result[cookie_id] = self.get_account_status(cookie_id)
+        return result
+
+    def update_connection_state(self, cookie_id: str, state: str):
+        """更新账号的WebSocket连接状态
+
+        Args:
+            cookie_id: Cookie ID
+            state: 连接状态（connected, connecting, disconnected, reconnecting, failed）
+        """
+        self.update_account_status(cookie_id, connection_state=state)
+
+    def update_cookie_validity(self, cookie_id: str, valid: bool, error: str = None):
+        """更新账号的Cookie有效性状态
+
+        Args:
+            cookie_id: Cookie ID
+            valid: Cookie是否有效
+            error: 错误信息（如果无效）
+        """
+        import time
+        self.update_account_status(
+            cookie_id,
+            cookie_valid=valid,
+            error_message=error,
+            last_check_time=int(time.time())
+        )
 
 
 # 在 Start.py 中会把此变量赋值为具体实例

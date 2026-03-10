@@ -1,6 +1,8 @@
 /* ================================
    【账号管理菜单】相关样式
    ================================ */
+
+/* 普通开关 */
 .status-toggle {
   position: relative;
   display: inline-block;
@@ -8,12 +10,24 @@
   height: 24px;
 }
 
-.status-toggle input {
+/* 小号状态开关 */
+.status-toggle-sm {
+  position: relative;
+  display: inline-block;
+  width: 40px;
+  height: 20px;
+}
+
+/* 隐藏原生checkbox */
+.status-toggle input,
+.status-toggle-sm input {
   opacity: 0;
   width: 0;
   height: 0;
+  position: absolute;
 }
 
+/* 滑块轨道背景 */
 .status-slider {
   position: absolute;
   cursor: pointer;
@@ -24,8 +38,10 @@
   background-color: #ccc;
   transition: .4s;
   border-radius: 24px;
+  display: block;
 }
 
+/* 滑块圆点 - 普通大小 */
 .status-slider:before {
   position: absolute;
   content: "";
@@ -36,14 +52,74 @@
   background-color: white;
   transition: .4s;
   border-radius: 50%;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.2);
 }
 
+/* 选中状态背景色 */
 input:checked + .status-slider {
   background-color: #10b981;
 }
 
+/* 选中状态滑动 - 普通 */
 input:checked + .status-slider:before {
   transform: translateX(26px);
+}
+
+/* 小号开关滑块圆点 */
+.status-toggle-sm .status-slider:before {
+  height: 14px;
+  width: 14px;
+  left: 3px;
+  bottom: 3px;
+}
+
+/* 小号开关选中状态滑动 */
+.status-toggle-sm input:checked + .status-slider:before {
+  transform: translateX(20px);
+}
+
+/* 小图标按钮 - 用于Cookie状态刷新等 */
+.btn-icon-xs {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid #0dcaf0;
+  background: transparent;
+  color: #0dcaf0;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  vertical-align: middle;
+}
+
+.btn-icon-xs:hover {
+  background: #0dcaf0;
+  color: white;
+}
+
+.btn-icon-xs:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-icon-xs i {
+  font-size: 0.75rem;
+  line-height: 1;
+}
+
+/* 暗色模式 */
+[data-theme="dark"] .btn-icon-xs {
+  border-color: rgba(13, 202, 240, 0.5);
+  color: #0dcaf0;
+}
+
+[data-theme="dark"] .btn-icon-xs:hover {
+  background: #0dcaf0;
+  color: #000;
 }
 
 .status-badge {

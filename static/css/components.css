@@ -11,6 +11,12 @@
 .spin {
     animation: spin 1s linear infinite;
 }
+
+/* 状态刷新旋转动画 */
+.spin-animation {
+    animation: spin 1s linear infinite;
+    display: inline-block;
+}
 .card {
   background: rgba(255, 255, 255, 0.95);
   backdrop-filter: blur(10px);
