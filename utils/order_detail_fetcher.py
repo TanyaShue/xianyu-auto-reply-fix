@@ -330,6 +330,33 @@ class OrderDetailFetcher:
                 # 额外等待确保动态内容加载完成
                 await asyncio.sleep(3)
 
+                # 检查页面状态
+                page_status = await self._check_page_status(order_id)
+                if not page_status['is_valid']:
+                    logger.warning(f"页面状态异常: {page_status}")
+                    if page_status['needs_login']:
+                        logger.error("检测到需要登录，Cookie可能已失效")
+                        # 返回特殊错误标记，通知上层需要重新登录
+                        return {
+                            'order_id': order_id,
+                            'error': 'NEED_LOGIN',
+                            'message': 'Cookie可能已失效，需要重新登录',
+                            'page_url': page_status['current_url'],
+                            'page_title': page_status['page_title'],
+                            'url': url,
+                            'title': page_status['page_title'],
+                            'sku_info': {},
+                            'spec_name': '',
+                            'spec_value': '',
+                            'spec_name_2': '',
+                            'spec_value_2': '',
+                            'quantity': '',
+                            'amount': '',
+                            'order_status': 'unknown',
+                            'timestamp': time.time(),
+                            'from_cache': False
+                        }
+
                 # 获取并解析SKU信息
                 sku_info = await self._get_sku_content()
 
@@ -619,7 +646,10 @@ class OrderDetailFetcher:
         ignore_tokens = [
             'http://', 'https://', 'fleamarket://', '订单', '买家', '卖家', '地址',
             '手机', '电话', '时间', '发货', '付款', '交易', '退款', '去发货', '修改价格',
-            '等待你发货', '等待买家', '已发货', '待收货', '待发货'
+            '等待你发货', '等待买家', '已发货', '待收货', '待发货',
+            # 新增：过滤备案信息
+            '统一社会信用代码', '增值电信', '许可证', '备案', 'ICP', '营业执照',
+            '广播电视', '演出许可', '集邮', 'APP备案', '网络食品', '食品经营'
         ]
 
         for line in lines:
@@ -791,6 +821,23 @@ class OrderDetailFetcher:
 
             result: Dict[str, str] = {}
 
+            # 输出页面URL和标题用于调试
+            try:
+                current_url = self.page.url
+                page_title = await self.page.title()
+                logger.info(f"📍 当前页面URL: {current_url}")
+                logger.info(f"📄 页面标题: {page_title}")
+            except Exception as e:
+                logger.warning(f"获取页面URL/标题失败: {e}")
+
+            # 输出页面内容摘要（前500字符）用于调试
+            try:
+                body_text = await self._get_page_text()
+                if body_text:
+                    logger.debug(f"📝 页面内容摘要: {body_text[:500]}...")
+            except Exception as e:
+                logger.warning(f"获取页面内容摘要失败: {e}")
+
             # 获取规格元素（主通道）
             sku_selector = '.sku--u_ddZval'
             sku_elements = await self.page.query_selector_all(sku_selector)
@@ -919,6 +966,88 @@ class OrderDetailFetcher:
         except Exception as e:
             logger.error(f"获取SKU内容失败: {e}")
             return {}
+
+    async def _check_page_status(self, order_id: str) -> Dict[str, Any]:
+        """
+        检查页面状态，检测是否正确加载、是否需要登录等
+
+        Args:
+            order_id: 订单ID，用于日志输出
+
+        Returns:
+            包含页面状态信息的字典：
+            - is_valid: 页面是否有效
+            - needs_login: 是否需要登录
+            - current_url: 当前页面URL
+            - page_title: 页面标题
+            - error_message: 错误信息
+        """
+        result = {
+            'is_valid': True,
+            'needs_login': False,
+            'current_url': '',
+            'page_title': '',
+            'error_message': ''
+        }
+
+        try:
+            # 获取当前页面URL和标题
+            current_url = self.page.url
+            page_title = await self.page.title()
+
+            result['current_url'] = current_url
+            result['page_title'] = page_title
+
+            # 检测是否被重定向到登录页面
+            login_indicators = ['login', 'signin', 'verify', 'captcha', 'safe']
+            if any(indicator in current_url.lower() for indicator in login_indicators):
+                result['is_valid'] = False
+                result['needs_login'] = True
+                result['error_message'] = f'页面被重定向到登录/验证页面: {current_url}'
+                logger.warning(f"订单 {order_id}: 检测到登录/验证页面重定向 - {current_url}")
+                return result
+
+            # 检测页面标题是否包含登录相关关键词
+            login_title_indicators = ['登录', '验证', '安全校验', '请登录', '扫码登录']
+            if any(indicator in page_title for indicator in login_title_indicators):
+                result['is_valid'] = False
+                result['needs_login'] = True
+                result['error_message'] = f'页面标题包含登录相关内容: {page_title}'
+                logger.warning(f"订单 {order_id}: 页面标题包含登录相关内容 - {page_title}")
+                return result
+
+            # 检测是否是正确的订单详情页面
+            expected_url_patterns = ['order-detail', 'orderId', 'goofish.com']
+            if not any(pattern in current_url for pattern in expected_url_patterns):
+                result['is_valid'] = False
+                result['error_message'] = f'页面URL不符合预期: {current_url}'
+                logger.warning(f"订单 {order_id}: 页面URL不符合预期 - {current_url}")
+                return result
+
+            # 检测页面是否包含订单详情的关键元素
+            try:
+                # 尝试查找订单相关元素
+                order_indicators = await self.page.query_selector_all('.sku--u_ddZval, [class*="order"], [class*="Order"]')
+                if not order_indicators:
+                    # 没有找到订单相关元素，可能页面结构异常或需要登录
+                    logger.warning(f"订单 {order_id}: 页面未找到订单相关元素")
+                    # 检查是否有登录按钮
+                    login_button = await self.page.query_selector('[class*="login"], button:has-text("登录")')
+                    if login_button:
+                        result['is_valid'] = False
+                        result['needs_login'] = True
+                        result['error_message'] = '页面存在登录按钮，Cookie可能已失效'
+                        logger.warning(f"订单 {order_id}: 检测到登录按钮，Cookie可能已失效")
+            except Exception as e:
+                logger.debug(f"检查订单元素时出错: {e}")
+
+            return result
+
+        except Exception as e:
+            logger.error(f"检查页面状态失败: {e}")
+            result['is_valid'] = False
+            result['error_message'] = str(e)
+            return result
 
     async def _check_browser_status(self) -> bool:
         """检查浏览器状态是否正常"""
