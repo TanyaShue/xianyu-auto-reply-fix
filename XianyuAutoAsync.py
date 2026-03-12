@@ -7080,27 +7080,8 @@ Cookie数量: {cookie_count}
                         logger.error(
                             f"获取订单详情失败 (尝试 {attempt}/{max_detail_attempts}): {self._safe_str(e)}"
                         )
-
-# 智能匹配发货规则：优先商品ID精确匹配，然后规格匹配，最后关键字匹配
-            delivery_rules = []
-            used_exact_match = False
-            used_item_id_match = False
-
-            # 第一步：商品ID精确匹配（优先级最高）
-            if item_id and item_id != "未知商品":
-                logger.info(f"尝试商品ID精确匹配发货规则: {item_id}")
-                delivery_rules = db_manager.get_delivery_rule_by_item_id(item_id, user_id=self.user_id)
-
-                if delivery_rules:
-                    logger.info(f"✅ 找到商品ID精确匹配的发货规则: {len(delivery_rules)}个")
-                    used_item_id_match = True
-                else:
-                    logger.info(f"❌ 未找到商品ID精确匹配的发货规则")
-
-            # 第二步：商品ID匹配失败时，使用规格模式匹配
-            if not delivery_rules:
-                    if attempt < max_detail_attempts:
-                        await asyncio.sleep(0.6)
+                        if attempt < max_detail_attempts:
+                            await asyncio.sleep(0.6)
 
                 if _get_order_spec_mode() == 'no_spec':
                     try:
@@ -7124,7 +7105,6 @@ Cookie数量: {cookie_count}
                     f"order_spec_mode={order_spec_mode}, item_id={item_id or 'unknown'}, "
                     f"order_id={order_id or 'unknown'}"
                 )
-                )
             elif order_spec_mode == 'no_spec' and item_config_multi_spec:
                 block_reason = (
                     f"商品已开启规格匹配，但订单未解析到有效规格信息，已阻断自动发货: "
@@ -7138,7 +7118,23 @@ Cookie数量: {cookie_count}
                 f"item_config_mode={item_config_mode}"
             )
 
-# 第二步：商品ID匹配失败时，使用规格模式匹配
+            # 智能匹配发货规则：优先商品ID精确匹配，然后规格匹配，最后关键字匹配
+            delivery_rules = []
+            used_exact_match = False
+            used_item_id_match = False
+
+            # 第一步：商品ID精确匹配（优先级最高）
+            if item_id and item_id != "未知商品":
+                logger.info(f"尝试商品ID精确匹配发货规则: {item_id}")
+                delivery_rules = db_manager.get_delivery_rule_by_item_id(item_id, user_id=self.user_id)
+
+                if delivery_rules:
+                    logger.info(f"✅ 找到商品ID精确匹配的发货规则: {len(delivery_rules)}个")
+                    used_item_id_match = True
+                else:
+                    logger.info(f"❌ 未找到商品ID精确匹配的发货规则")
+
+            # 第二步：商品ID匹配失败时，使用规格模式匹配
             if not delivery_rules:
                 if order_spec_mode == 'two_spec':
                     match_mode = 'two_spec_exact'

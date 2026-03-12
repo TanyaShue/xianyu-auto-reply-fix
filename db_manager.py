@@ -4608,7 +4608,7 @@ Cookie数量: {cookie_count}
                 logger.error(f"获取发货规则列表失败: {e}")
                 return []
 
-def get_delivery_rule_by_item_id(self, item_id: str, user_id: int = None):
+    def get_delivery_rule_by_item_id(self, item_id: str, user_id: int = None):
         """根据商品ID精确匹配发货规则
 
         Args:
