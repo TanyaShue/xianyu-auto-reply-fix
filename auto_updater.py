@@ -12,9 +12,9 @@
 
 支持更新的文件类型：
 - Python 源文件 (.py)
-- 前端文件 (.js, .css, .html)
+- 前端文件 (.js, .ts, .tsx, .jsx, .vue, .css, .html, .txt, .json)
 - 配置文件 (.yml, .json)
-- 静态资源
+- 静态资源（图片、字体等）
 """
 
 import os
@@ -57,12 +57,21 @@ class FileUpdate:
 
 
 @dataclass
+class DeletedFile:
+    """待删除文件信息"""
+    path: str
+    requires_restart: bool
+    description: str = ""
+
+
+@dataclass
 class UpdateManifest:
     """更新清单"""
     version: str                      # 版本号
     release_date: str                 # 发布日期
     description: str                  # 版本说明
     files: List[FileUpdate]           # 文件列表
+    deleted_files: List[DeletedFile] = None  # 待删除文件列表
     min_version: str = ""             # 最低兼容版本
     changelog: List[str] = None       # 更新日志
 
@@ -82,12 +91,20 @@ class UpdateProgress:
 
 class AutoUpdater:
     """自动更新器"""
+
+    # 默认 GitHub 更新源配置
+    DEFAULT_GITHUB_API_BASE = "https://api.github.com"
+    DEFAULT_GITHUB_RAW_BASE = "https://raw.githubusercontent.com"
+    DEFAULT_GITHUB_OWNER = "GuDong2003"
+    DEFAULT_GITHUB_REPO = "xianyu-auto-reply-fix"
     
-    # 默认更新服务器地址
-    DEFAULT_UPDATE_SERVER = "http://116.196.116.76"
-    
-    # 可热更新的文件类型（不需要重启）
-    HOT_UPDATABLE_EXTENSIONS = {'.js', '.css', '.html', '.json', '.yml', '.yaml'}
+    # 可热更新的静态文件类型（通常不需要重启）
+    HOT_UPDATABLE_EXTENSIONS = {
+        '.css', '.eot', '.gif', '.html', '.ico', '.jpeg', '.jpg',
+        '.js', '.json', '.jsx', '.map', '.otf', '.png', '.svg',
+        '.ts', '.tsx', '.ttf', '.vue',
+        '.txt', '.webp', '.woff', '.woff2', '.yml', '.yaml',
+    }
     
     # 需要重启的文件类型
     RESTART_REQUIRED_EXTENSIONS = {'.py', '.pyd', '.so', '.dll', '.exe'}
@@ -100,23 +117,49 @@ class AutoUpdater:
         'uploads/',
         '__pycache__/',
         '.git/',
+        '.github/',
+        '.claude/',
+        '.ace-tool/',
+        '.pytest_cache/',
+        'build/',
+        'nginx/',
+        'dist/',
+        'node_modules/',
+        'qr_screenshots/',
+        'trajectory_history/',
+        'update_backup/',
+        'venv/',
         'global_config.yml',  # 用户配置文件不更新
+        'update_files.json',
+        'Dockerfile',
+        'Dockerfile-cn',
+        'docker-compose.yml',
+        'docker-compose-cn.yml',
     }
     
     def __init__(self, 
                  app_dir: Optional[str] = None,
                  update_server: Optional[str] = None,
+                 github_owner: Optional[str] = None,
+                 github_repo: Optional[str] = None,
+                 github_token: Optional[str] = None,
                  current_version: str = "1.0.0"):
         """
         初始化更新器
         
         Args:
             app_dir: 应用目录，默认为当前工作目录
-            update_server: 更新服务器地址
+            update_server: 兼容旧参数，保留但不再作为默认更新源
+            github_owner: GitHub 仓库 owner
+            github_repo: GitHub 仓库 repo
+            github_token: GitHub API Token（可选，用于提升限额）
             current_version: 当前版本号
         """
         self.app_dir = Path(app_dir) if app_dir else Path.cwd()
-        self.update_server = update_server or self.DEFAULT_UPDATE_SERVER
+        self.github_owner = github_owner or os.getenv("UPDATE_GITHUB_OWNER", self.DEFAULT_GITHUB_OWNER)
+        self.github_repo = github_repo or os.getenv("UPDATE_GITHUB_REPO", self.DEFAULT_GITHUB_REPO)
+        self.github_token = (github_token or os.getenv("UPDATE_GITHUB_TOKEN", "")).strip()
+        self.update_server = update_server or f"{self.github_owner}/{self.github_repo}"
         self.current_version = current_version
         self.backup_dir = self.app_dir / "update_backup"
         
@@ -127,7 +170,10 @@ class AutoUpdater:
         # 确保备份目录存在
         self.backup_dir.mkdir(parents=True, exist_ok=True)
         
-        logger.info(f"自动更新器初始化: app_dir={self.app_dir}, server={self.update_server}, version={self.current_version}")
+        logger.info(
+            "自动更新器初始化: "
+            f"app_dir={self.app_dir}, repo={self.github_owner}/{self.github_repo}, version={self.current_version}"
+        )
     
     def add_progress_callback(self, callback: callable):
         """添加进度回调"""
@@ -171,6 +217,75 @@ class AutoUpdater:
         """检查文件更新是否需要重启"""
         ext = Path(file_path).suffix.lower()
         return ext in self.RESTART_REQUIRED_EXTENSIONS
+
+    def refresh_current_version(self) -> str:
+        """从本地版本文件刷新当前版本号，避免长生命周期进程读到旧版本"""
+        version = self.current_version or "1.0.0"
+        version_file = self.app_dir / "static" / "version.txt"
+
+        try:
+            if version_file.exists():
+                file_version = version_file.read_text(encoding="utf-8").strip()
+                if file_version:
+                    version = file_version
+        except Exception as e:
+            logger.warning(f"读取本地版本文件失败，继续使用缓存版本: {e}")
+            return self.current_version
+
+        if version != self.current_version:
+            logger.info(f"检测到本地版本变更: {self.current_version} -> {version}")
+            self.current_version = version
+
+        return self.current_version
+
+    def _build_request_headers(self, accept_json: bool = True) -> Dict[str, str]:
+        """构建 GitHub 请求头"""
+        headers = {
+            "User-Agent": f"XianyuAutoReplyUpdater/{self.current_version}",
+        }
+        if accept_json:
+            headers["Accept"] = "application/vnd.github+json"
+        if self.github_token:
+            headers["Authorization"] = f"Bearer {self.github_token}"
+        return headers
+
+    def _build_latest_release_url(self) -> str:
+        """构建 GitHub 最新 release API 地址"""
+        return (
+            f"{self.DEFAULT_GITHUB_API_BASE}/repos/"
+            f"{self.github_owner}/{self.github_repo}/releases/latest"
+        )
+
+    def _build_raw_file_url(self, tag: str, relative_path: str) -> str:
+        """构建 GitHub raw 文件地址"""
+        relative_path = relative_path.replace("\\", "/").lstrip("/")
+        return (
+            f"{self.DEFAULT_GITHUB_RAW_BASE}/"
+            f"{self.github_owner}/{self.github_repo}/{tag}/{relative_path}"
+        )
+
+    def _extract_changelog(self, release_data: Dict[str, Any]) -> List[str]:
+        """从 release body 中提取简易更新日志"""
+        body = (release_data.get("body") or "").strip()
+        if not body:
+            return []
+
+        changelog = []
+        for raw_line in body.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith(("- ", "* ", "+ ")):
+                line = line[2:].strip()
+            changelog.append(line)
+        return changelog
+
+    def _find_asset_download_url(self, release_data: Dict[str, Any], asset_name: str) -> Optional[str]:
+        """查找指定 release asset 的浏览器下载地址"""
+        for asset in release_data.get("assets", []) or []:
+            if asset.get("name") == asset_name:
+                return asset.get("browser_download_url")
+        return None
     
     async def check_for_updates(self) -> Optional[UpdateManifest]:
         """
@@ -179,53 +294,94 @@ class AutoUpdater:
         Returns:
             UpdateManifest: 更新清单，如果没有更新则返回None
         """
+        self.refresh_current_version()
         self._update_progress(status=UpdateStatus.CHECKING, message="正在检查更新...")
         
         try:
-            manifest_url = f"{self.update_server}/xianyu/update_manifest.php?version={self.current_version}"
-            
             async with aiohttp.ClientSession() as session:
-                async with session.get(manifest_url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                release_url = self._build_latest_release_url()
+                async with session.get(
+                    release_url,
+                    headers=self._build_request_headers(),
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as response:
+                    if response.status != 200:
+                        logger.warning(f"获取 GitHub Release 失败: HTTP {response.status}")
+                        self._update_progress(status=UpdateStatus.IDLE, message="检查更新失败")
+                        return None
+
+                    release_data = await response.json()
+
+                release_tag = (release_data.get("tag_name") or "").strip()
+                if not release_tag:
+                    logger.warning("GitHub Release 缺少 tag_name，无法检查更新")
+                    self._update_progress(status=UpdateStatus.IDLE, message="检查更新失败")
+                    return None
+
+                manifest_url = self._find_asset_download_url(release_data, "update_files.json")
+                if not manifest_url:
+                    manifest_url = self._build_raw_file_url(release_tag, "update_files.json")
+
+                async with session.get(
+                    manifest_url,
+                    headers=self._build_request_headers(accept_json=False),
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as response:
                     if response.status != 200:
                         logger.warning(f"获取更新清单失败: HTTP {response.status}")
                         self._update_progress(status=UpdateStatus.IDLE, message="检查更新失败")
                         return None
-                    
-                    data = await response.json()
-                    
-                    if not data.get('success'):
-                        logger.info(f"没有可用更新: {data.get('message', '未知')}")
-                        self._update_progress(status=UpdateStatus.IDLE, message="已是最新版本")
+
+                    manifest_text = await response.text()
+                    try:
+                        manifest_data = json.loads(manifest_text)
+                    except json.JSONDecodeError as exc:
+                        logger.warning(f"解析更新清单失败: {exc}")
+                        self._update_progress(status=UpdateStatus.IDLE, message="检查更新失败")
                         return None
-                    
-                    manifest_data = data.get('data', {})
-                    
-                    # 解析文件列表
-                    files = []
-                    for file_info in manifest_data.get('files', []):
-                        files.append(FileUpdate(
-                            path=file_info['path'],
-                            md5=file_info['md5'],
-                            size=file_info.get('size', 0),
-                            download_url=file_info['download_url'],
-                            version=file_info.get('version', manifest_data.get('version', '')),
-                            requires_restart=file_info.get('requires_restart', self._needs_restart(file_info['path'])),
-                            description=file_info.get('description', '')
-                        ))
-                    
-                    manifest = UpdateManifest(
-                        version=manifest_data.get('version', ''),
-                        release_date=manifest_data.get('release_date', ''),
-                        description=manifest_data.get('description', ''),
-                        files=files,
-                        min_version=manifest_data.get('min_version', ''),
-                        changelog=manifest_data.get('changelog', [])
-                    )
-                    
-                    logger.info(f"发现新版本: {manifest.version}, 共 {len(files)} 个文件需要更新")
-                    self._update_progress(status=UpdateStatus.IDLE, message=f"发现新版本 {manifest.version}")
-                    
-                    return manifest
+
+                manifest_version = manifest_data.get("version") or release_tag
+                changelog = manifest_data.get("changelog") or self._extract_changelog(release_data)
+
+                files = []
+                for file_info in manifest_data.get("files", []):
+                    file_path = file_info["path"].replace("\\", "/")
+                    files.append(FileUpdate(
+                        path=file_path,
+                        md5=file_info.get("md5", ""),
+                        size=file_info.get("size", 0),
+                        download_url=self._build_raw_file_url(release_tag, file_path),
+                        version=file_info.get("version", manifest_version),
+                        requires_restart=file_info.get("requires_restart", self._needs_restart(file_path)),
+                        description=file_info.get("description", "")
+                    ))
+
+                deleted_files = []
+                for file_info in manifest_data.get("deleted_files", []):
+                    file_path = file_info["path"].replace("\\", "/")
+                    deleted_files.append(DeletedFile(
+                        path=file_path,
+                        requires_restart=file_info.get("requires_restart", self._needs_restart(file_path)),
+                        description=file_info.get("description", "")
+                    ))
+
+                manifest = UpdateManifest(
+                    version=manifest_version,
+                    release_date=manifest_data.get("release_date") or release_data.get("published_at", ""),
+                    description=manifest_data.get("description") or release_data.get("name") or f"版本 {manifest_version} 更新",
+                    files=files,
+                    deleted_files=deleted_files,
+                    min_version=manifest_data.get("min_version", ""),
+                    changelog=changelog
+                )
+
+                logger.info(
+                    f"发现发布版本: {manifest.version}, 共 {len(files)} 个文件可用于比对更新, "
+                    f"{len(deleted_files)} 个文件待删除"
+                )
+                self._update_progress(status=UpdateStatus.IDLE, message=f"已获取版本 {manifest.version} 的更新清单")
+
+                return manifest
                     
         except asyncio.TimeoutError:
             logger.error("检查更新超时")
@@ -247,11 +403,14 @@ class AutoUpdater:
             需要更新的文件列表
         """
         files_to_update = []
+        excluded_count = 0
+        up_to_date_count = 0
         
         for file_update in manifest.files:
             # 跳过被排除的文件
             if self._is_excluded(file_update.path):
                 logger.debug(f"跳过排除的文件: {file_update.path}")
+                excluded_count += 1
                 continue
             
             local_path = self.app_dir / file_update.path
@@ -269,9 +428,30 @@ class AutoUpdater:
                 files_to_update.append(file_update)
                 logger.debug(f"需要更新: {file_update.path} (本地MD5: {local_md5}, 远程MD5: {file_update.md5})")
             else:
-                logger.debug(f"文件已是最新: {file_update.path}")
+                up_to_date_count += 1
+
+        logger.info(
+            f"更新检查完成: 共 {len(manifest.files)} 个文件, 需要更新 {len(files_to_update)} 个, "
+            f"已是最新 {up_to_date_count} 个, 排除 {excluded_count} 个"
+        )
         
         return files_to_update
+
+    async def get_files_to_delete(self, manifest: UpdateManifest) -> List[DeletedFile]:
+        """获取本地实际存在且允许删除的旧文件列表"""
+        files_to_delete = []
+
+        for deleted_file in manifest.deleted_files or []:
+            if self._is_excluded(deleted_file.path):
+                logger.debug(f"跳过排除的删除路径: {deleted_file.path}")
+                continue
+
+            local_path = self.app_dir / deleted_file.path
+            if local_path.exists() and local_path.is_file():
+                files_to_delete.append(deleted_file)
+                logger.debug(f"需要删除旧文件: {deleted_file.path}")
+
+        return files_to_delete
     
     # 非关键文件，MD5校验失败时可以继续更新（仅警告不报错）
     NON_CRITICAL_FILES = {'version.txt', 'update_log.txt', 'changelog.txt'}
@@ -341,6 +521,18 @@ class AutoUpdater:
         except Exception as e:
             logger.error(f"备份文件失败: {file_path}, {e}")
             return False
+
+    def _cleanup_empty_parent_dirs(self, directory: Path):
+        """清理因删除文件产生的空目录"""
+        current = directory
+
+        while current != self.app_dir and current != current.parent:
+            try:
+                current.rmdir()
+            except OSError:
+                break
+
+            current = current.parent
     
     async def apply_updates(self, files_to_update: List[FileUpdate]) -> Tuple[bool, List[str], bool]:
         """
@@ -435,6 +627,61 @@ class AutoUpdater:
             )
         
         return True, updated_files, needs_restart
+
+    async def apply_deletions(self, files_to_delete: List[DeletedFile]) -> Tuple[bool, List[str], bool]:
+        """
+        删除 manifest 中声明的旧文件
+
+        Args:
+            files_to_delete: 待删除文件列表
+
+        Returns:
+            (是否成功, 删除的文件列表, 是否需要重启)
+        """
+        if not files_to_delete:
+            return True, [], False
+
+        deleted_paths = []
+        needs_restart = False
+
+        self._update_progress(
+            status=UpdateStatus.INSTALLING,
+            total_files=len(files_to_delete),
+            message=f"正在清理 {len(files_to_delete)} 个旧文件..."
+        )
+
+        for index, deleted_file in enumerate(files_to_delete):
+            self._update_progress(
+                current_file=deleted_file.path,
+                current_index=index + 1,
+                message=f"正在删除旧文件: {deleted_file.path}"
+            )
+
+            local_path = self.app_dir / deleted_file.path
+            if not local_path.exists():
+                continue
+
+            if not self._backup_file(local_path):
+                logger.warning(f"删除前备份失败，继续删除: {deleted_file.path}")
+
+            try:
+                local_path.unlink()
+                deleted_paths.append(deleted_file.path)
+
+                if deleted_file.requires_restart:
+                    needs_restart = True
+
+                self._cleanup_empty_parent_dirs(local_path.parent)
+                logger.info(f"删除旧文件成功: {deleted_file.path}")
+            except Exception as e:
+                logger.error(f"删除旧文件失败: {deleted_file.path}, {e}")
+                self._update_progress(
+                    status=UpdateStatus.FAILED,
+                    error=f"删除旧文件失败: {deleted_file.path}"
+                )
+                return False, deleted_paths, needs_restart
+
+        return True, deleted_paths, needs_restart
     
     async def perform_update(self, manifest: Optional[UpdateManifest] = None) -> Dict[str, Any]:
         """
@@ -450,11 +697,13 @@ class AutoUpdater:
             "success": False,
             "message": "",
             "updated_files": [],
+            "deleted_files": [],
             "needs_restart": False,
             "new_version": ""
         }
         
         try:
+            self.refresh_current_version()
             # 检查更新
             if manifest is None:
                 manifest = await self.check_for_updates()
@@ -468,28 +717,44 @@ class AutoUpdater:
             
             # 获取需要更新的文件
             files_to_update = await self.get_files_to_update(manifest)
+            files_to_delete = await self.get_files_to_delete(manifest)
             
-            if not files_to_update:
+            if not files_to_update and not files_to_delete:
                 result["message"] = "所有文件已是最新"
                 result["success"] = True
                 return result
             
-            logger.info(f"开始更新 {len(files_to_update)} 个文件到版本 {manifest.version}")
+            logger.info(
+                f"开始更新到版本 {manifest.version}: {len(files_to_update)} 个文件更新, "
+                f"{len(files_to_delete)} 个文件待删除"
+            )
             
             # 应用更新
             success, updated_files, needs_restart = await self.apply_updates(files_to_update)
+            deleted_files: List[str] = []
+
+            if success:
+                success, deleted_files, delete_restart = await self.apply_deletions(files_to_delete)
+                needs_restart = needs_restart or delete_restart
             
             result["success"] = success
             result["updated_files"] = updated_files
+            result["deleted_files"] = deleted_files
             result["needs_restart"] = needs_restart
             
             if success:
-                result["message"] = f"成功更新 {len(updated_files)} 个文件到版本 {manifest.version}"
+                message_parts = []
+                if updated_files:
+                    message_parts.append(f"更新 {len(updated_files)} 个文件")
+                if deleted_files:
+                    message_parts.append(f"删除 {len(deleted_files)} 个旧文件")
+
+                result["message"] = f"成功{'，'.join(message_parts) if message_parts else '处理变更'}到版本 {manifest.version}"
                 if needs_restart:
                     result["message"] += "，需要重启应用生效"
                 
                 # 更新成功后，保存文件哈希清单（用于以后对比）
-                self.save_file_hashes(manifest.version, updated_files)
+                self.save_file_hashes(manifest.version, updated_files, deleted_files)
             else:
                 result["message"] = "更新过程中出现错误"
             
@@ -512,7 +777,28 @@ class AutoUpdater:
             {文件路径: MD5哈希}
         """
         if file_patterns is None:
-            file_patterns = ['*.py', '*.js', '*.css', '*.html', '*.yml', '*.yaml', '*.json']
+            try:
+                from generate_update_manifest import collect_updatable_files
+
+                file_hashes = {}
+                for relative_path in collect_updatable_files(self.app_dir):
+                    if self._is_excluded(relative_path):
+                        continue
+
+                    file_path = self.app_dir / relative_path
+                    file_hashes[relative_path] = self._calculate_file_md5(file_path)
+
+                return file_hashes
+            except Exception as e:
+                logger.debug(f"使用 manifest 扫描规则获取本地哈希失败，回退到后缀模式: {e}")
+
+            file_patterns = [
+                '*.py', '*.js', '*.ts', '*.tsx', '*.jsx', '*.vue',
+                '*.css', '*.html', '*.txt', '*.json', '*.map',
+                '*.yml', '*.yaml', '*.png', '*.jpg', '*.jpeg',
+                '*.gif', '*.svg', '*.ico', '*.webp', '*.woff',
+                '*.woff2', '*.eot', '*.otf', '*.ttf',
+            ]
         
         file_hashes = {}
         
@@ -550,7 +836,12 @@ class AutoUpdater:
         except Exception as e:
             logger.error(f"清理备份失败: {e}")
     
-    def save_file_hashes(self, version: str, updated_files: List[str] = None):
+    def save_file_hashes(
+        self,
+        version: str,
+        updated_files: List[str] = None,
+        deleted_files: List[str] = None,
+    ):
         """
         保存文件哈希清单到本地
         
@@ -580,6 +871,9 @@ class AutoUpdater:
             if updated_files:
                 manifest["last_updated_files"] = updated_files
                 manifest["last_updated_count"] = len(updated_files)
+            if deleted_files:
+                manifest["last_deleted_files"] = deleted_files
+                manifest["last_deleted_count"] = len(deleted_files)
             
             # 保存到文件
             with open(hash_file, 'w', encoding='utf-8') as f:
@@ -723,4 +1017,3 @@ def init_updater(app_dir: str = None, update_server: str = None, current_version
     )
     
     return _updater
-

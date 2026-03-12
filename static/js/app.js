@@ -32,6 +32,10 @@ let currentOrdersPage = 1; // 当前页码
 let ordersPerPage = 20; // 每页显示数量
 let totalOrdersPages = 0; // 总页数
 let currentOrderSearchKeyword = ''; // 当前搜索关键词
+let ordersStreamAbortController = null;
+let ordersStreamReconnectTimer = null;
+let ordersStreamRetryCount = 0;
+let ordersStreamShouldRun = false;
 let loadingRequestCount = 0;
 let loadingShowTimer = null;
 const LOADING_SHOW_DELAY = 120;
@@ -142,6 +146,10 @@ function showSection(sectionName) {
     case 'data-management':  // 【数据管理菜单】
         loadDataManagement();
         break;
+    }
+
+    if (sectionName !== 'orders') {
+        stopOrdersStream();
     }
 
     // 如果切换到非日志页面，停止自动刷新
@@ -941,10 +949,13 @@ function normalizeOrderStatus(status) {
     const aliasMap = {
         success: 'completed',
         finished: 'completed',
-        pending_ship: 'pending_delivery',
+        pending_delivery: 'pending_ship',
+        partial_success: 'partial_success',
+        partial_pending_finalize: 'partial_pending_finalize',
         delivered: 'shipped',
-        cancelled: 'closed',
-        refunded: 'closed'
+        closed: 'cancelled',
+        refunded: 'cancelled',
+        canceled: 'cancelled'
     };
     return aliasMap[value] || value || 'unknown';
 }
@@ -954,15 +965,30 @@ function isCompletedOrder(normalizedStatus) {
 }
 
 function isCompletionEligibleOrder(normalizedStatus) {
-    const completionEligibleStatuses = ['pending_delivery', 'shipped', 'completed', 'closed'];
+    const completionEligibleStatuses = ['pending_ship', 'partial_success', 'partial_pending_finalize', 'shipped', 'completed', 'cancelled'];
     return completionEligibleStatuses.includes(normalizedStatus);
 }
 
-function isTodayOrder(createdAt) {
-    if (!createdAt) return false;
+function parseUtcDateTime(dateString) {
+    if (!dateString) return null;
 
-    const orderDate = new Date(createdAt);
-    if (Number.isNaN(orderDate.getTime())) return false;
+    if (dateString instanceof Date) {
+        return Number.isNaN(dateString.getTime()) ? null : dateString;
+    }
+
+    const raw = String(dateString).trim();
+    if (!raw) return null;
+
+    const normalized = raw.includes('T') ? raw : raw.replace(' ', 'T');
+    const hasTimezone = /([zZ]|[+-]\d{2}:\d{2})$/.test(normalized);
+    const parsed = new Date(hasTimezone ? normalized : `${normalized}Z`);
+
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function isTodayOrder(createdAt) {
+    const orderDate = parseUtcDateTime(createdAt);
+    if (!orderDate) return false;
 
     const now = new Date();
     return (
@@ -1110,11 +1136,48 @@ function renderDashboardDeliveryLogs(logs) {
             ? '<span class="badge bg-success">成功</span>'
             : '<span class="badge bg-danger">失败</span>';
 
-        let matchBadge = '<span class="badge bg-secondary">未知</span>';
-        if (log.match_mode === 'exact') {
-            matchBadge = '<span class="badge bg-primary">精确</span>';
-        } else if (log.match_mode === 'fallback') {
-            matchBadge = '<span class="badge bg-warning text-dark">兜底</span>';
+        const matchModeLabelMap = {
+            no_spec_match: '无规格',
+            one_spec_exact: '一组规格',
+            one_spec_fallback_no_spec: '单规兜底',
+            two_spec_exact: '两组规格',
+            blocked_no_rule: '无规则',
+            blocked_no_spec_parsed: '缺少规格',
+            blocked_multiple_no_spec_rules: '多规则阻断',
+            blocked_rule_mode_mismatch: '模式不一致'
+        };
+
+        const specModeLabelMap = {
+            no_spec: '无规格',
+            one_spec: '一组规格',
+            two_spec: '两组规格',
+            spec_enabled: '已开规格'
+        };
+
+        function buildBadge(text, className) {
+            return `<span class="badge ${className}">${escapeHtml(text)}</span>`;
+        }
+
+        let matchBadge = buildBadge(matchModeLabelMap[log.match_mode] || (log.match_mode || '未知'), 'bg-secondary');
+        if (log.match_mode === 'one_spec_exact' || log.match_mode === 'two_spec_exact') {
+            matchBadge = buildBadge(matchModeLabelMap[log.match_mode], 'bg-primary');
+        } else if (log.match_mode === 'one_spec_fallback_no_spec') {
+            matchBadge = buildBadge(matchModeLabelMap[log.match_mode], 'bg-info text-dark');
+        } else if (log.match_mode === 'no_spec_match') {
+            matchBadge = buildBadge(matchModeLabelMap[log.match_mode], 'bg-warning text-dark');
+        } else if (String(log.match_mode || '').startsWith('blocked_')) {
+            matchBadge = buildBadge(matchModeLabelMap[log.match_mode] || log.match_mode, 'bg-danger');
+        }
+
+        const specBadges = [];
+        if (log.order_spec_mode) {
+            specBadges.push(buildBadge(`订单:${specModeLabelMap[log.order_spec_mode] || log.order_spec_mode}`, 'bg-info text-dark'));
+        }
+        if (log.rule_spec_mode) {
+            specBadges.push(buildBadge(`规则:${specModeLabelMap[log.rule_spec_mode] || log.rule_spec_mode}`, 'bg-light text-dark border'));
+        }
+        if (log.item_config_mode) {
+            specBadges.push(buildBadge(`商品:${specModeLabelMap[log.item_config_mode] || log.item_config_mode}`, 'bg-secondary'));
         }
 
         const ruleText = log.rule_keyword
@@ -1136,6 +1199,7 @@ function renderDashboardDeliveryLogs(logs) {
                     ${matchBadge}
                     <span class="badge bg-light text-dark border">${escapeHtml(channelText)}</span>
                 </div>
+                ${specBadges.length ? `<div class="mt-1 d-flex gap-1 align-items-center flex-wrap">${specBadges.join('')}</div>` : ''}
             </td>
             <td>${statusBadge}</td>
             <td class="dashboard-delivery-reason" title="${escapeHtml(reasonText)}">${escapeHtml(reasonText)}</td>
@@ -2303,14 +2367,23 @@ function showToast(message, type = 'success') {
     toast.setAttribute('aria-live', 'assertive');
     toast.setAttribute('aria-atomic', 'true');
 
-    toast.innerHTML = `
-    <div class="d-flex">
-        <div class="toast-body">
-        ${message}
-        </div>
-        <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
-    </div>
-    `;
+    const toastRow = document.createElement('div');
+    toastRow.className = 'd-flex';
+
+    const toastBody = document.createElement('div');
+    toastBody.className = 'toast-body';
+    toastBody.style.whiteSpace = 'pre-line';
+    toastBody.textContent = String(message ?? '');
+
+    const closeButton = document.createElement('button');
+    closeButton.type = 'button';
+    closeButton.className = 'btn-close btn-close-white me-2 m-auto';
+    closeButton.setAttribute('data-bs-dismiss', 'toast');
+    closeButton.setAttribute('aria-label', 'Close');
+
+    toastRow.appendChild(toastBody);
+    toastRow.appendChild(closeButton);
+    toast.appendChild(toastRow);
 
     toastContainer.appendChild(toast);
     const bsToast = new bootstrap.Toast(toast, { delay: 5000 });  // 增加显示时间到5秒
@@ -2575,7 +2648,7 @@ async function loadCookies() {
             <button class="btn btn-sm btn-outline-warning" onclick="configAIReply('${cookie.id}')" title="配置AI回复" ${!isEnabled ? 'disabled' : ''}>
                 <i class="bi bi-robot"></i>
             </button>
-            <button class="btn btn-sm btn-outline-info" onclick="copyCookie('${cookie.id}', '${cookie.value}')" title="复制Cookie">
+            <button class="btn btn-sm btn-outline-info" onclick="copyCookie('${cookie.id}')" title="复制Cookie">
                 <i class="bi bi-clipboard"></i>
             </button>
             
@@ -2592,13 +2665,10 @@ async function loadCookies() {
     document.querySelectorAll('.cookie-value').forEach(element => {
         element.style.cursor = 'pointer';
         element.addEventListener('click', function() {
-        const cookieValue = this.textContent;
-        if (cookieValue && cookieValue !== '未设置') {
-            navigator.clipboard.writeText(cookieValue).then(() => {
-            showToast('Cookie已复制到剪贴板', 'success');
-            }).catch(() => {
-            showToast('复制失败，请手动复制', 'error');
-            });
+        const row = this.closest('tr');
+        const cookieId = row?.querySelector('.cookie-id strong')?.textContent;
+        if (cookieId) {
+            copyCookie(cookieId);
         }
         });
     });
@@ -2786,28 +2856,35 @@ async function checkCookieValidity(cookieId) {
 }
 
 // 复制Cookie
-function copyCookie(id, value) {
+async function copyCookie(id) {
+    try {
+    const details = await fetchJSON(`${apiBase}/cookie/${encodeURIComponent(id)}/details?include_secrets=true`);
+    const value = details?.value || '';
+
     if (!value || value === '未设置') {
-    showToast('该账号暂无Cookie值', 'warning');
-    return;
+        showToast('该账号暂无Cookie值', 'warning');
+        return;
     }
 
     navigator.clipboard.writeText(value).then(() => {
-    showToast(`账号 "${id}" 的Cookie已复制到剪贴板`, 'success');
-    }).catch(() => {
-    // 降级方案：创建临时文本框
-    const textArea = document.createElement('textarea');
-    textArea.value = value;
-    document.body.appendChild(textArea);
-    textArea.select();
-    try {
-        document.execCommand('copy');
         showToast(`账号 "${id}" 的Cookie已复制到剪贴板`, 'success');
-    } catch (err) {
-        showToast('复制失败，请手动复制', 'error');
-    }
-    document.body.removeChild(textArea);
+    }).catch(() => {
+        const textArea = document.createElement('textarea');
+        textArea.value = value;
+        document.body.appendChild(textArea);
+        textArea.select();
+        try {
+            document.execCommand('copy');
+            showToast(`账号 "${id}" 的Cookie已复制到剪贴板`, 'success');
+        } catch (err) {
+            showToast('复制失败，请手动复制', 'error');
+        }
+        document.body.removeChild(textArea);
     });
+    } catch (error) {
+    console.error('获取Cookie详情失败:', error);
+    showToast('获取Cookie详情失败，请稍后重试', 'danger');
+    }
 }
 
 // 刷新真实Cookie
@@ -2819,8 +2896,7 @@ async function refreshRealCookie(cookieId) {
 
     // 获取当前cookie值
     try {
-        const cookieDetails = await fetchJSON(`${apiBase}/cookies/details`);
-        const currentCookie = cookieDetails.find(c => c.id === cookieId);
+        const currentCookie = await fetchJSON(`${apiBase}/cookie/${encodeURIComponent(cookieId)}/details?include_secrets=true`);
 
         if (!currentCookie || !currentCookie.value) {
             showToast('未找到有效的Cookie信息', 'warning');
@@ -2980,7 +3056,7 @@ async function editCookieInline(id, currentValue) {
         toggleLoading(true);
         
         // 获取账号详细信息
-        const details = await fetchJSON(apiBase + `/cookie/${id}/details`);
+        const details = await fetchJSON(apiBase + `/cookie/${id}/details?include_secrets=true`);
         
         // 打开编辑模态框
         openAccountEditModal(details);
@@ -2995,18 +3071,18 @@ async function editCookieInline(id, currentValue) {
 // 打开账号编辑模态框
 async function openAccountEditModal(accountData) {
     // 设置模态框数据
-    document.getElementById('editAccountId').value = accountData.id;
+    document.getElementById('accountEditId').value = accountData.id;
     document.getElementById('editAccountCookie').value = accountData.value || '';
     document.getElementById('editAccountUsername').value = accountData.username || '';
     document.getElementById('editAccountPassword').value = accountData.password || '';
     document.getElementById('editAccountShowBrowser').checked = accountData.show_browser || false;
     
     // 显示账号ID
-    document.getElementById('editAccountIdDisplay').textContent = accountData.id;
+    document.getElementById('accountEditIdDisplay').textContent = accountData.id;
     
     // 加载代理配置
     try {
-        const proxyData = await fetchJSON(apiBase + `/cookie/${accountData.id}/proxy`);
+        const proxyData = await fetchJSON(apiBase + `/cookie/${accountData.id}/proxy?include_secret=true`);
         if (proxyData && proxyData.data) {
             document.getElementById('editProxyType').value = proxyData.data.proxy_type || 'none';
             document.getElementById('editProxyHost').value = proxyData.data.proxy_host || '';
@@ -3052,7 +3128,7 @@ function toggleProxyFields() {
 
 // 保存账号编辑
 async function saveAccountEdit() {
-    const id = document.getElementById('editAccountId').value;
+    const id = document.getElementById('accountEditId').value;
     const cookie = document.getElementById('editAccountCookie').value.trim();
     const username = document.getElementById('editAccountUsername').value.trim();
     const password = document.getElementById('editAccountPassword').value.trim();
@@ -3852,6 +3928,11 @@ async function checkAuth() {
         systemRestartBtn.style.display = 'inline-block';
         }
 
+        const dashboardHotUpdateGroup = document.getElementById('dashboardHotUpdateGroup');
+        if (dashboardHotUpdateGroup) {
+        dashboardHotUpdateGroup.style.display = 'inline-flex';
+        }
+
         // 显示登录与注册设置
         const loginInfoSettings = document.getElementById('login-info-settings');
         if (loginInfoSettings) {
@@ -4150,8 +4231,8 @@ async function editDefaultReply(accountId) {
     }
 
     // 填充编辑表单
-    document.getElementById('editAccountId').value = accountId;
-    document.getElementById('editAccountIdDisplay').value = accountId;
+    document.getElementById('editDefaultReplyAccountId').value = accountId;
+    document.getElementById('editDefaultReplyAccountIdDisplay').value = accountId;
     document.getElementById('editDefaultReplyEnabled').checked = settings.enabled;
     document.getElementById('editReplyContent').value = settings.reply_content || '';
     document.getElementById('editReplyOnce').checked = settings.reply_once || false;
@@ -4178,7 +4259,7 @@ function toggleReplyContentVisibility() {
 // 保存默认回复设置
 async function saveDefaultReply() {
     try {
-    const accountId = document.getElementById('editAccountId').value;
+    const accountId = document.getElementById('editDefaultReplyAccountId').value;
     const enabled = document.getElementById('editDefaultReplyEnabled').checked;
     const replyContent = document.getElementById('editReplyContent').value;
     const replyOnce = document.getElementById('editReplyOnce').checked;
@@ -4712,7 +4793,7 @@ const outgoingConfigs = {
                 id: 'smtp_from',
                 label: '发件人显示名（可选）',
                 type: 'text',
-                placeholder: '闲鱼自动回复系统',
+                placeholder: '闲鱼管理系统',
                 required: false,
                 help: '邮件发件人显示的名称，留空则使用邮箱地址'
             },
@@ -4838,7 +4919,7 @@ const channelTypeConfigs = {
         id: 'title',
         label: '通知标题（可选）',
         type: 'text',
-        placeholder: '闲鱼自动回复通知',
+        placeholder: '闲鱼管理系统通知',
         required: false,
         help: '推送通知的标题'
         },
@@ -5011,7 +5092,7 @@ function showAddChannelModal(type) {
     fieldsContainer.innerHTML = '';
 
     config.fields.forEach(field => {
-    const fieldHtml = generateFieldHtml(field, '');
+    const fieldHtml = generateFieldHtml(field, 'add_');
     fieldsContainer.insertAdjacentHTML('beforeend', fieldHtml);
     });
 
@@ -5058,6 +5139,7 @@ async function saveNotificationChannel() {
     const type = document.getElementById('channelType').value;
     const name = document.getElementById('channelName').value;
     const enabled = document.getElementById('channelEnabled').checked;
+    const form = document.getElementById('addChannelForm');
 
     if (!name.trim()) {
     showToast('请输入渠道名称', 'warning');
@@ -5075,7 +5157,12 @@ async function saveNotificationChannel() {
     let hasError = false;
 
     config.fields.forEach(field => {
-    const element = document.getElementById(field.id);
+    const element = form ? form.querySelector(`#add_${field.id}`) : null;
+    if (!element) {
+        showToast(`找不到${field.label}输入框`, 'danger');
+        hasError = true;
+        return;
+    }
     const value = element.value.trim();
 
     if (field.required && !value) {
@@ -6098,7 +6185,7 @@ function renderCardsList(cards) {
         <td>${delayDisplay}</td>
         <td>${statusBadge}</td>
         <td>
-        <small class="text-muted">${new Date(card.created_at).toLocaleString('zh-CN')}</small>
+        <small class="text-muted">${formatDateTime(card.created_at)}</small>
         </td>
         <td>
         <div class="btn-group" role="group">
@@ -9403,16 +9490,57 @@ function updateBatchDeleteButton() {
     }
 }
 
+function toggleSelectAllItemReplies(selectAllCheckbox) {
+    const checkboxes = document.querySelectorAll('input[name="itemReplyCheckbox"]');
+    checkboxes.forEach(checkbox => {
+        checkbox.checked = selectAllCheckbox.checked;
+    });
+    updateItemReplyBatchDeleteButton();
+}
+
+function updateItemReplySelectAllState() {
+    const checkboxes = document.querySelectorAll('input[name="itemReplyCheckbox"]');
+    const checkedCheckboxes = document.querySelectorAll('input[name="itemReplyCheckbox"]:checked');
+    const selectAllCheckbox = document.getElementById('selectAllItemReplies');
+
+    if (!selectAllCheckbox) return;
+
+    if (checkboxes.length === 0) {
+        selectAllCheckbox.checked = false;
+        selectAllCheckbox.indeterminate = false;
+    } else if (checkedCheckboxes.length === checkboxes.length) {
+        selectAllCheckbox.checked = true;
+        selectAllCheckbox.indeterminate = false;
+    } else if (checkedCheckboxes.length > 0) {
+        selectAllCheckbox.checked = false;
+        selectAllCheckbox.indeterminate = true;
+    } else {
+        selectAllCheckbox.checked = false;
+        selectAllCheckbox.indeterminate = false;
+    }
+
+    updateItemReplyBatchDeleteButton();
+}
+
+function updateItemReplyBatchDeleteButton() {
+    const checkedCheckboxes = document.querySelectorAll('input[name="itemReplyCheckbox"]:checked');
+    const batchDeleteBtn = document.getElementById('batchDeleteItemRepliesBtn');
+
+    if (!batchDeleteBtn) return;
+
+    if (checkedCheckboxes.length > 0) {
+        batchDeleteBtn.disabled = false;
+        batchDeleteBtn.innerHTML = `<i class="bi bi-trash"></i> 批量删除 (${checkedCheckboxes.length})`;
+    } else {
+        batchDeleteBtn.disabled = true;
+        batchDeleteBtn.innerHTML = '<i class="bi bi-trash"></i> 批量删除';
+    }
+}
+
 // 格式化日期时间
 function formatDateTime(dateString) {
-    if (!dateString) return '未知';
-    // 如果是ISO格式，直接new Date
-    if (dateString.includes('T') && dateString.endsWith('Z')) {
-        return new Date(dateString).toLocaleString('zh-CN');
-    }
-    // 否则按原有逻辑（可选：补偿8小时）
-    const date = new Date(dateString.replace(' ', 'T') + 'Z');
-    return date.toLocaleString('zh-CN');
+    const date = parseUtcDateTime(dateString);
+    return date ? date.toLocaleString('zh-CN') : '未知';
 }
 
 // HTML转义函数
@@ -9444,7 +9572,7 @@ async function loadItemsReplay() {
 // 只刷新商品回复数据，不重新加载筛选器
 async function refreshItemsReplayData() {
     try {
-    const selectedCookie = document.getElementById('itemCookieFilter').value;
+    const selectedCookie = document.getElementById('itemReplayCookieFilter').value;
     if (selectedCookie) {
         await loadItemsReplayByCookie();
     } else {
@@ -9591,14 +9719,14 @@ function displayItemReplays(items) {
     const tbody = document.getElementById('itemReplaysTableBody');
 
     if (!items || items.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted">暂无商品数据</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" class="text-center text-muted">暂无商品数据</td></tr>';
     // 重置选择状态
-    const selectAllCheckbox = document.getElementById('selectAllItems');
+    const selectAllCheckbox = document.getElementById('selectAllItemReplies');
     if (selectAllCheckbox) {
         selectAllCheckbox.checked = false;
         selectAllCheckbox.indeterminate = false;
     }
-    updateBatchDeleteButton();
+    updateItemReplyBatchDeleteButton();
     return;
     }
 
@@ -9630,10 +9758,10 @@ function displayItemReplays(items) {
     return `
         <tr>
          <td>
-            <input type="checkbox" name="itemCheckbox"
+            <input type="checkbox" name="itemReplyCheckbox"
                     data-cookie-id="${escapeHtml(item.cookie_id)}"
                     data-item-id="${escapeHtml(item.item_id)}"
-                    onchange="updateSelectAllState()">
+                    onchange="updateItemReplySelectAllState()">
         </td>
         <td>${escapeHtml(item.cookie_id)}</td>
         <td>${escapeHtml(item.item_id)}</td>
@@ -9659,12 +9787,12 @@ function displayItemReplays(items) {
     tbody.innerHTML = itemsHtml;
 
     // 重置选择状态
-    const selectAllCheckbox = document.getElementById('selectAllItems');
+    const selectAllCheckbox = document.getElementById('selectAllItemReplies');
     if (selectAllCheckbox) {
     selectAllCheckbox.checked = false;
     selectAllCheckbox.indeterminate = false;
     }
-    updateBatchDeleteButton();
+    updateItemReplyBatchDeleteButton();
 }
 
 // 显示添加弹框
@@ -9835,7 +9963,7 @@ async function deleteItemReply(cookieId, itemId, itemTitle) {
 // 批量删除商品回复
 async function batchDeleteItemReplies() {
   try {
-    const checkboxes = document.querySelectorAll('input[name="itemCheckbox"]:checked');
+    const checkboxes = document.querySelectorAll('input[name="itemReplyCheckbox"]:checked');
     if (checkboxes.length === 0) {
       showToast('请选择要删除回复的商品', 'warning');
       return;
@@ -10381,9 +10509,9 @@ async function loadRefreshCookieAccountList() {
                 const option = document.createElement('option');
                 option.value = cookie.id;
                 // 显示账号ID和是否配置了用户名密码
-                const hasCredentials = cookie.username ? '(已配置账密)' : '(未配置账密)';
+                const hasCredentials = cookie.username && cookie.has_password ? '(已配置账密)' : '(未配置账密)';
                 option.textContent = `${cookie.id} ${hasCredentials}`;
-                option.dataset.hasCredentials = cookie.username ? 'true' : 'false';
+                option.dataset.hasCredentials = cookie.username && cookie.has_password ? 'true' : 'false';
                 option.dataset.username = cookie.username || '';
                 select.appendChild(option);
             });
@@ -11850,6 +11978,7 @@ async function loadSystemSettings() {
             const outgoingConfigs = document.getElementById('outgoing-configs');
             const backupManagement = document.getElementById('backup-management');
             const systemRestartBtn = document.getElementById('system-restart-btn');
+            const dashboardHotUpdateGroup = document.getElementById('dashboardHotUpdateGroup');
 
             if (apiSecuritySettings) {
                 apiSecuritySettings.style.display = isAdmin ? 'block' : 'none';
@@ -11866,9 +11995,13 @@ async function loadSystemSettings() {
             if (systemRestartBtn) {
                 systemRestartBtn.style.display = isAdmin ? 'inline-block' : 'none';
             }
+            if (dashboardHotUpdateGroup) {
+                dashboardHotUpdateGroup.style.display = isAdmin ? 'inline-flex' : 'none';
+            }
 
             // 如果是管理员，加载所有管理员设置
             if (isAdmin) {
+                refreshHotUpdatePreferencesMenu();
                 await loadAPISecuritySettings();
                 await loadRegistrationSettings();
                 await loadLoginInfoSettings();
@@ -11879,8 +12012,12 @@ async function loadSystemSettings() {
         console.error('获取用户信息失败:', error);
         // 出错时隐藏管理员功能
         const loginInfoSettings = document.getElementById('login-info-settings');
+        const dashboardHotUpdateGroup = document.getElementById('dashboardHotUpdateGroup');
         if (loginInfoSettings) {
             loginInfoSettings.style.display = 'none';
+        }
+        if (dashboardHotUpdateGroup) {
+            dashboardHotUpdateGroup.style.display = 'none';
         }
     }
 }
@@ -12340,6 +12477,157 @@ async function updateLoginInfoSettings() {
 // 订单管理功能
 // ================================
 
+function isOrdersSectionActive() {
+    const section = document.getElementById('orders-section');
+    return !!section && section.classList.contains('active');
+}
+
+function stopOrdersStream() {
+    ordersStreamShouldRun = false;
+
+    if (ordersStreamReconnectTimer) {
+        clearTimeout(ordersStreamReconnectTimer);
+        ordersStreamReconnectTimer = null;
+    }
+
+    if (ordersStreamAbortController) {
+        ordersStreamAbortController.abort();
+        ordersStreamAbortController = null;
+    }
+}
+
+window.addEventListener('pagehide', stopOrdersStream);
+
+function scheduleOrdersStreamReconnect() {
+    if (!ordersStreamShouldRun || !isOrdersSectionActive()) return;
+    if (ordersStreamReconnectTimer) return;
+
+    const retryDelay = Math.min(10000, [1000, 2000, 5000, 10000][Math.min(ordersStreamRetryCount, 3)]);
+    ordersStreamReconnectTimer = setTimeout(() => {
+        ordersStreamReconnectTimer = null;
+        startOrdersStream();
+    }, retryDelay);
+}
+
+function handleOrdersStreamEvent(eventName, payloadText) {
+    if (!payloadText) return;
+    if (eventName === 'ping' || eventName === 'stream.ready') return;
+
+    try {
+        const payload = JSON.parse(payloadText);
+        if (eventName === 'order.updated' && payload.order) {
+            applyRealtimeOrderUpdate(payload.order);
+        }
+    } catch (error) {
+        console.error('解析订单实时事件失败:', error, payloadText);
+    }
+}
+
+function applyRealtimeOrderUpdate(order) {
+    if (!order || !order.order_id) return;
+
+    const existingIndex = allOrdersData.findIndex(item => item.order_id === order.order_id);
+    if (existingIndex === -1) {
+        refreshOrdersData();
+        return;
+    }
+
+    allOrdersData[existingIndex] = {
+        ...allOrdersData[existingIndex],
+        ...order,
+    };
+
+    filterOrders(false);
+}
+
+async function consumeOrdersStream(response, controller) {
+    if (!response.body) {
+        throw new Error('订单实时流不可用');
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buffer = '';
+
+    while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (controller.signal.aborted) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const chunks = buffer.split(/\r?\n\r?\n/);
+        buffer = chunks.pop() || '';
+
+        chunks.forEach(chunk => {
+            let eventName = 'message';
+            const dataLines = [];
+
+            chunk.split(/\r?\n/).forEach(line => {
+                if (line.startsWith('event:')) {
+                    eventName = line.slice(6).trim();
+                } else if (line.startsWith('data:')) {
+                    dataLines.push(line.slice(5).trimStart());
+                }
+            });
+
+            handleOrdersStreamEvent(eventName, dataLines.join('\n'));
+        });
+    }
+}
+
+async function startOrdersStream() {
+    if (!authToken || !isOrdersSectionActive()) return;
+    if (ordersStreamAbortController) return;
+
+    ordersStreamShouldRun = true;
+
+    if (ordersStreamReconnectTimer) {
+        clearTimeout(ordersStreamReconnectTimer);
+        ordersStreamReconnectTimer = null;
+    }
+
+    const controller = new AbortController();
+    ordersStreamAbortController = controller;
+
+    try {
+        const response = await fetch(`${apiBase}/api/orders/stream`, {
+            headers: {
+                'Authorization': `Bearer ${authToken}`,
+                'Accept': 'text/event-stream'
+            },
+            cache: 'no-store',
+            signal: controller.signal
+        });
+
+        if (response.status === 401) {
+            localStorage.removeItem('auth_token');
+            window.location.href = '/';
+            return;
+        }
+
+        if (!response.ok) {
+            throw new Error(`订单实时流连接失败: HTTP ${response.status}`);
+        }
+
+        ordersStreamRetryCount = 0;
+        await consumeOrdersStream(response, controller);
+    } catch (error) {
+        if (!controller.signal.aborted) {
+            ordersStreamRetryCount += 1;
+            console.error('订单实时流异常:', error);
+            scheduleOrdersStreamReconnect();
+        }
+    } finally {
+        if (ordersStreamAbortController === controller) {
+            ordersStreamAbortController = null;
+        }
+
+        if (!controller.signal.aborted && ordersStreamShouldRun && isOrdersSectionActive()) {
+            scheduleOrdersStreamReconnect();
+        }
+    }
+}
+
 // 加载订单列表
 async function loadOrders() {
     try {
@@ -12348,6 +12636,8 @@ async function loadOrders() {
 
         // 加载订单列表
         await refreshOrdersData();
+
+        startOrdersStream();
     } catch (error) {
         console.error('加载订单列表失败:', error);
         showToast('加载订单列表失败', 'danger');
@@ -12357,12 +12647,7 @@ async function loadOrders() {
 // 只刷新订单数据，不重新加载筛选器
 async function refreshOrdersData() {
     try {
-        const selectedCookie = document.getElementById('orderCookieFilter').value;
-        if (selectedCookie) {
-            await loadOrdersByCookie();
-        } else {
-            await loadAllOrders();
-        }
+        await loadAllOrders();
     } catch (error) {
         console.error('刷新订单数据失败:', error);
         showToast('刷新订单数据失败', 'danger');
@@ -12372,7 +12657,10 @@ async function refreshOrdersData() {
 // 加载Cookie筛选选项
 async function loadOrderCookieFilter() {
     try {
-        const response = await fetch(`${apiBase}/admin/data/orders`, {
+        const select = document.getElementById('orderCookieFilter');
+        const previousValue = select ? select.value : '';
+
+        const response = await fetch(`${apiBase}/api/orders`, {
             headers: {
                 'Authorization': `Bearer ${authToken}`
             }
@@ -12383,7 +12671,6 @@ async function loadOrderCookieFilter() {
             // 提取唯一的cookie_id
             const cookieIds = [...new Set(data.data.map(order => order.cookie_id).filter(id => id))];
 
-            const select = document.getElementById('orderCookieFilter');
             if (select) {
                 select.innerHTML = '<option value="">所有账号</option>';
 
@@ -12393,6 +12680,10 @@ async function loadOrderCookieFilter() {
                     option.textContent = cookieId;
                     select.appendChild(option);
                 });
+
+                if (previousValue && cookieIds.includes(previousValue)) {
+                    select.value = previousValue;
+                }
             }
         }
     } catch (error) {
@@ -12413,10 +12704,14 @@ async function loadAllOrders() {
         if (data.success) {
             allOrdersData = data.data || [];
             // 按创建时间倒序排列
-            allOrdersData.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+            allOrdersData.sort((a, b) => {
+                const bTime = parseUtcDateTime(b.created_at)?.getTime() || 0;
+                const aTime = parseUtcDateTime(a.created_at)?.getTime() || 0;
+                return bTime - aTime;
+            });
 
             // 应用当前筛选条件
-            filterOrders();
+            filterOrders(false);
         } else {
             console.error('加载订单失败:', data.message);
             showToast('加载订单数据失败: ' + data.message, 'danger');
@@ -12429,42 +12724,15 @@ async function loadAllOrders() {
 
 // 根据Cookie加载订单
 async function loadOrdersByCookie() {
-    const selectedCookie = document.getElementById('orderCookieFilter').value;
-    if (!selectedCookie) {
-        await loadAllOrders();
-        return;
-    }
-
-    try {
-        const response = await fetch(`${apiBase}/api/orders`, {
-            headers: {
-                'Authorization': `Bearer ${authToken}`
-            }
-        });
-
-        const data = await response.json();
-        if (data.success) {
-            // 筛选指定Cookie的订单
-            allOrdersData = (data.data || []).filter(order => order.cookie_id === selectedCookie);
-            // 按创建时间倒序排列
-            allOrdersData.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-
-            // 应用当前筛选条件
-            filterOrders();
-        } else {
-            console.error('加载订单失败:', data.message);
-            showToast('加载订单数据失败: ' + data.message, 'danger');
-        }
-    } catch (error) {
-        console.error('加载订单失败:', error);
-        showToast('加载订单数据失败，请检查网络连接', 'danger');
-    }
+    filterOrders(false);
 }
 
 // 筛选订单
-function filterOrders() {
+function filterOrders(resetPage = true) {
     const searchKeyword = document.getElementById('orderSearchInput')?.value.toLowerCase() || '';
     const statusFilter = document.getElementById('orderStatusFilter')?.value || '';
+    const cookieFilter = document.getElementById('orderCookieFilter')?.value || '';
+    const normalizedStatusFilter = statusFilter ? normalizeOrderStatus(statusFilter) : '';
 
     filteredOrdersData = allOrdersData.filter(order => {
         // 搜索关键词筛选（订单ID、商品ID、买家ID、买家昵称）
@@ -12474,20 +12742,29 @@ function filterOrders() {
             (order.buyer_id && order.buyer_id.toLowerCase().includes(searchKeyword)) ||
             (order.buyer_nick && order.buyer_nick.toLowerCase().includes(searchKeyword));
 
-        // 状态筛选
-        const matchesStatus = !statusFilter || order.order_status === statusFilter;
+        const matchesCookie = !cookieFilter || order.cookie_id === cookieFilter;
+        const matchesStatus = !normalizedStatusFilter || normalizeOrderStatus(order.order_status) === normalizedStatusFilter;
 
-        return matchesSearch && matchesStatus;
+        return matchesSearch && matchesCookie && matchesStatus;
     });
 
     currentOrderSearchKeyword = searchKeyword;
-    currentOrdersPage = 1; // 重置到第一页
+    if (resetPage) {
+        currentOrdersPage = 1; // 重置到第一页
+    }
 
     updateOrdersDisplay();
 }
 
 // 更新订单显示
 function updateOrdersDisplay() {
+    const computedTotalPages = filteredOrdersData.length === 0 ? 0 : Math.ceil(filteredOrdersData.length / ordersPerPage);
+    if (computedTotalPages === 0) {
+        currentOrdersPage = 1;
+    } else {
+        currentOrdersPage = Math.min(currentOrdersPage, computedTotalPages);
+    }
+
     displayOrders();
     updateOrdersPagination();
     updateOrdersSearchStats();
@@ -12525,65 +12802,81 @@ function createOrderRow(order) {
     const statusClass = getOrderStatusClass(order.order_status);
     const statusText = getOrderStatusText(order.order_status);
     const normalizedStatus = normalizeOrderStatus(order.order_status);
+    const orderId = escapeHtml(order.order_id || '');
+    const itemId = escapeHtml(order.item_id || '-');
+    const buyerId = escapeHtml(order.buyer_id || '-');
+    const buyerNick = escapeHtml(order.buyer_nick || '-');
+    const cookieId = escapeHtml(order.cookie_id || '-');
+    const specName = escapeHtml(order.spec_name || '');
+    const specValue = escapeHtml(order.spec_value || '');
+    const specName2 = escapeHtml(order.spec_name_2 || '');
+    const specValue2 = escapeHtml(order.spec_value_2 || '');
+    const quantity = escapeHtml(order.quantity || '-');
+    const amountDisplay = escapeHtml(formatOrderAmountDisplay(order.amount));
 
     // 判断是否可以手动发货（允许多次发货，除了交易关闭的订单）
-    const canDeliver = !['closed', 'refunding'].includes(normalizedStatus);
+    const canDeliver = !['cancelled', 'refunding'].includes(normalizedStatus);
+
+    let specHtml = '-';
+    if (order.spec_name && order.spec_value) {
+        specHtml = `<small class="text-muted">${specName}:</small><br>${specValue}`;
+        if (order.spec_name_2 && order.spec_value_2) {
+            specHtml += `<br><small class="text-muted">${specName2}:</small><br>${specValue2}`;
+        }
+    }
 
     return `
         <tr>
             <td>
-                <input type="checkbox" class="order-checkbox" value="${order.order_id}">
+                <input type="checkbox" class="order-checkbox" value="${orderId}">
             </td>
             <td>
-                <span class="text-truncate d-inline-block" style="max-width: 120px;" title="${order.order_id}">
-                    ${order.order_id}
+                <span class="text-truncate d-inline-block" style="max-width: 120px;" title="${orderId}">
+                    ${orderId}
                 </span>
             </td>
             <td>
-                <span class="text-truncate d-inline-block" style="max-width: 100px;" title="${order.item_id || ''}">
-                    ${order.item_id || '-'}
+                <span class="text-truncate d-inline-block" style="max-width: 100px;" title="${itemId === '-' ? '' : itemId}">
+                    ${itemId}
                 </span>
             </td>
             <td>
-                <span class="text-truncate d-inline-block" style="max-width: 80px;" title="${order.buyer_id || ''}">
-                    ${order.buyer_id || '-'}
+                <span class="text-truncate d-inline-block" style="max-width: 80px;" title="${buyerId === '-' ? '' : buyerId}">
+                    ${buyerId}
                 </span>
             </td>
             <td>
-                <span class="text-truncate d-inline-block" style="max-width: 100px;" title="${order.buyer_nick || ''}">
-                    ${order.buyer_nick || '-'}
+                <span class="text-truncate d-inline-block" style="max-width: 100px;" title="${buyerNick === '-' ? '' : buyerNick}">
+                    ${buyerNick}
                 </span>
             </td>
             <td>
-                ${order.spec_name && order.spec_value ?
-                    `<small class="text-muted">${order.spec_name}:</small><br>${order.spec_value}${order.spec_name_2 && order.spec_value_2 ? `<br><small class="text-muted">${order.spec_name_2}:</small><br>${order.spec_value_2}` : ''}` :
-                    '-'
-                }
+                ${specHtml}
             </td>
-            <td>${order.quantity || '-'}</td>
+            <td>${quantity}</td>
             <td>
-                <span class="text-success fw-bold">${formatOrderAmountDisplay(order.amount)}</span>
+                <span class="text-success fw-bold">${amountDisplay}</span>
             </td>
             <td>
-                <span class="badge ${statusClass}">${statusText}</span>
+                <span class="badge ${statusClass}">${escapeHtml(statusText)}</span>
             </td>
             <td>
-                <span class="text-truncate d-inline-block" style="max-width: 80px;" title="${order.cookie_id || ''}">
-                    ${order.cookie_id || '-'}
+                <span class="text-truncate d-inline-block" style="max-width: 80px;" title="${cookieId === '-' ? '' : cookieId}">
+                    ${cookieId}
                 </span>
             </td>
             <td>
                 <div class="btn-group btn-group-sm" role="group">
-                    <button class="btn btn-outline-success btn-sm" onclick="manualDeliverOrder('${order.order_id}')" title="手动发货" ${canDeliver ? '' : 'disabled'}>
+                    <button class="btn btn-outline-success btn-sm order-action-btn" data-order-action="deliver" data-order-id="${orderId}" title="手动发货" ${canDeliver ? '' : 'disabled'}>
                         <i class="bi bi-truck"></i>
                     </button>
-                    <button class="btn btn-outline-info btn-sm" onclick="refreshOrderStatus('${order.order_id}')" title="刷新状态">
+                    <button class="btn btn-outline-info btn-sm order-action-btn" data-order-action="refresh" data-order-id="${orderId}" title="刷新状态">
                         <i class="bi bi-arrow-repeat"></i>
                     </button>
-                    <button class="btn btn-outline-primary btn-sm" onclick="showOrderDetail('${order.order_id}')" title="查看详情">
+                    <button class="btn btn-outline-primary btn-sm order-action-btn" data-order-action="detail" data-order-id="${orderId}" title="查看详情">
                         <i class="bi bi-eye"></i>
                     </button>
-                    <button class="btn btn-outline-danger btn-sm" onclick="deleteOrder('${order.order_id}')" title="删除">
+                    <button class="btn btn-outline-danger btn-sm order-action-btn" data-order-action="delete" data-order-id="${orderId}" title="删除">
                         <i class="bi bi-trash"></i>
                     </button>
                 </div>
@@ -12598,14 +12891,17 @@ function getOrderStatusClass(status) {
     const statusMap = {
         'processing': 'bg-warning text-dark',
         'pending_payment': 'bg-warning text-dark',
-        'pending_delivery': 'bg-info text-white',
+        'pending_ship': 'bg-info text-white',
+        'partial_success': 'bg-primary-subtle text-primary-emphasis',
+        'partial_pending_finalize': 'bg-warning-subtle text-warning-emphasis',
         'shipped': 'bg-primary text-white',
         'completed': 'bg-success text-white',
         'success': 'bg-success text-white',
         'refunding': 'bg-warning text-dark',
-        'closed': 'bg-secondary text-white',
+        'refund_cancelled': 'bg-info text-dark',
+        'cancelled': 'bg-secondary text-white',
         'unknown': 'bg-secondary text-white'
-    };
+    }; 
     return statusMap[normalizedStatus] || statusMap[status] || 'bg-secondary text-white';
 }
 
@@ -12615,12 +12911,15 @@ function getOrderStatusText(status) {
     const statusMap = {
         'processing': '处理中',
         'pending_payment': '待付款',
-        'pending_delivery': '待发货',
+        'pending_ship': '待发货',
+        'partial_success': '部分发货',
+        'partial_pending_finalize': '部分待收尾',
         'shipped': '已发货',
         'completed': '交易成功',
         'success': '交易成功',
         'refunding': '申请退款中',
-        'closed': '交易关闭',
+        'refund_cancelled': '退款已撤销',
+        'cancelled': '交易关闭',
         'unknown': '未知'
     };
     return statusMap[normalizedStatus] || statusMap[status] || status || '未知';
@@ -12766,6 +13065,21 @@ async function showOrderDetail(orderId) {
         }
 
         // 创建模态框内容
+        const safeOrderId = escapeHtml(order.order_id || '');
+        const safeItemId = escapeHtml(order.item_id || '未知');
+        const safeBuyerId = escapeHtml(order.buyer_id || '未知');
+        const safeBuyerNick = escapeHtml(order.buyer_nick || '未知');
+        const safeCookieId = escapeHtml(order.cookie_id || '未知');
+        const safeSpecName = escapeHtml(order.spec_name || '无');
+        const safeSpecValue = escapeHtml(order.spec_value || '无');
+        const safeSpecName2 = escapeHtml(order.spec_name_2 || '无');
+        const safeSpecValue2 = escapeHtml(order.spec_value_2 || '无');
+        const safeQuantity = escapeHtml(order.quantity || '1');
+        const safeAmount = escapeHtml(formatOrderAmountDisplay(order.amount));
+        const safeCreatedAt = escapeHtml(formatDateTime(order.created_at));
+        const safeUpdatedAt = escapeHtml(formatDateTime(order.updated_at));
+        const safeStatusText = escapeHtml(getOrderStatusText(order.order_status));
+
         const modalContent = `
             <div class="modal fade" id="orderDetailModal" tabindex="-1">
                 <div class="modal-dialog modal-lg">
@@ -12782,23 +13096,23 @@ async function showOrderDetail(orderId) {
                                 <div class="col-md-6">
                                     <h6>基本信息</h6>
                                     <table class="table table-sm">
-                                        <tr><td>订单ID</td><td>${order.order_id}</td></tr>
-                                        <tr><td>商品ID</td><td>${order.item_id || '未知'}</td></tr>
-                                        <tr><td>买家ID</td><td>${order.buyer_id || '未知'}</td></tr>
-                                        <tr><td>买家昵称</td><td>${order.buyer_nick || '未知'}</td></tr>
-                                        <tr><td>Cookie账号</td><td>${order.cookie_id || '未知'}</td></tr>
-                                        <tr><td>订单状态</td><td><span class="badge ${getOrderStatusClass(order.order_status)}">${getOrderStatusText(order.order_status)}</span></td></tr>
+                                        <tr><td>订单ID</td><td>${safeOrderId}</td></tr>
+                                        <tr><td>商品ID</td><td>${safeItemId}</td></tr>
+                                        <tr><td>买家ID</td><td>${safeBuyerId}</td></tr>
+                                        <tr><td>买家昵称</td><td>${safeBuyerNick}</td></tr>
+                                        <tr><td>Cookie账号</td><td>${safeCookieId}</td></tr>
+                                        <tr><td>订单状态</td><td><span class="badge ${getOrderStatusClass(order.order_status)}">${safeStatusText}</span></td></tr>
                                     </table>
                                 </div>
                                 <div class="col-md-6">
                                     <h6>商品信息</h6>
                                     <table class="table table-sm">
-                                        <tr><td>规格1名称</td><td>${order.spec_name || '无'}</td></tr>
-                                        <tr><td>规格1值</td><td>${order.spec_value || '无'}</td></tr>
-                                        <tr><td>规格2名称</td><td>${order.spec_name_2 || '无'}</td></tr>
-                                        <tr><td>规格2值</td><td>${order.spec_value_2 || '无'}</td></tr>
-                                        <tr><td>数量</td><td>${order.quantity || '1'}</td></tr>
-                                        <tr><td>金额</td><td>${formatOrderAmountDisplay(order.amount)}</td></tr>
+                                        <tr><td>规格1名称</td><td>${safeSpecName}</td></tr>
+                                        <tr><td>规格1值</td><td>${safeSpecValue}</td></tr>
+                                        <tr><td>规格2名称</td><td>${safeSpecName2}</td></tr>
+                                        <tr><td>规格2值</td><td>${safeSpecValue2}</td></tr>
+                                        <tr><td>数量</td><td>${safeQuantity}</td></tr>
+                                        <tr><td>金额</td><td>${safeAmount}</td></tr>
                                     </table>
                                 </div>
                             </div>
@@ -12806,8 +13120,8 @@ async function showOrderDetail(orderId) {
                                 <div class="col-12">
                                     <h6>时间信息</h6>
                                     <table class="table table-sm">
-                                        <tr><td>创建时间</td><td>${formatDateTime(order.created_at)}</td></tr>
-                                        <tr><td>更新时间</td><td>${formatDateTime(order.updated_at)}</td></tr>
+                                        <tr><td>创建时间</td><td>${safeCreatedAt}</td></tr>
+                                        <tr><td>更新时间</td><td>${safeUpdatedAt}</td></tr>
                                     </table>
                                 </div>
                             </div>
@@ -12875,25 +13189,30 @@ async function loadItemDetailForOrder(itemId, cookieId) {
         if (response.ok) {
             const data = await response.json();
             const item = data.item;
+            const safeTitle = escapeHtml(item.item_title || '商品标题未知');
+            const safeDescription = escapeHtml(item.item_description || '暂无描述');
+            const safeCategory = escapeHtml(item.item_category || '未知');
+            const safePrice = escapeHtml(item.item_price || '未知');
+            const safeDetail = escapeHtml(item.item_detail || '');
 
             content.innerHTML = `
                 <div class="card">
                     <div class="card-body">
-                        <h6 class="card-title">${item.item_title || '商品标题未知'}</h6>
-                        <p class="card-text">${item.item_description || '暂无描述'}</p>
+                        <h6 class="card-title">${safeTitle}</h6>
+                        <p class="card-text">${safeDescription}</p>
                         <div class="row">
                             <div class="col-md-6">
-                                <small class="text-muted">分类：${item.item_category || '未知'}</small>
+                                <small class="text-muted">分类：${safeCategory}</small>
                             </div>
                             <div class="col-md-6">
-                                <small class="text-muted">价格：${item.item_price || '未知'}</small>
+                                <small class="text-muted">价格：${safePrice}</small>
                             </div>
                         </div>
                         ${item.item_detail ? `
                             <div class="mt-2">
                                 <small class="text-muted">详情：</small>
                                 <div class="border p-2 mt-1" style="max-height: 200px; overflow-y: auto;">
-                                    <small>${item.item_detail}</small>
+                                    <small>${safeDetail}</small>
                                 </div>
                             </div>
                         ` : ''}
@@ -12915,7 +13234,7 @@ async function loadItemDetailForOrder(itemId, cookieId) {
             content.innerHTML = `
                 <div class="alert alert-danger">
                     <i class="bi bi-exclamation-triangle me-2"></i>
-                    加载商品详情失败：${error.message}
+                    加载商品详情失败：${escapeHtml(error.message || '未知错误')}
                 </div>
             `;
         }
@@ -12930,7 +13249,7 @@ async function deleteOrder(orderId) {
             return;
         }
 
-        const response = await fetch(`${apiBase}/admin/data/orders/${orderId}`, {
+        const response = await fetch(`${apiBase}/api/orders/${orderId}`, {
             method: 'DELETE',
             headers: {
                 'Authorization': `Bearer ${authToken}`
@@ -12970,7 +13289,7 @@ async function batchDeleteOrders() {
 
         for (const orderId of orderIds) {
             try {
-                const response = await fetch(`${apiBase}/admin/data/orders/${orderId}`, {
+                const response = await fetch(`${apiBase}/api/orders/${orderId}`, {
                     method: 'DELETE',
                     headers: {
                         'Authorization': `Bearer ${authToken}`
@@ -13158,6 +13477,25 @@ document.addEventListener('DOMContentLoaded', function() {
         document.addEventListener('change', function(e) {
             if (e.target.classList.contains('order-checkbox')) {
                 updateOrderBatchButtons();
+            }
+        });
+
+        document.addEventListener('click', function(e) {
+            const actionButton = e.target.closest('.order-action-btn');
+            if (!actionButton) return;
+
+            const orderId = actionButton.dataset.orderId;
+            const action = actionButton.dataset.orderAction;
+            if (!orderId || !action) return;
+
+            if (action === 'deliver') {
+                manualDeliverOrder(orderId);
+            } else if (action === 'refresh') {
+                refreshOrderStatus(orderId);
+            } else if (action === 'detail') {
+                showOrderDetail(orderId);
+            } else if (action === 'delete') {
+                deleteOrder(orderId);
             }
         });
     }, 100);
@@ -14207,11 +14545,72 @@ let currentRiskLogStatus = '';
 let currentRiskLogOffset = 0;
 const riskLogLimit = 100;
 
+async function fetchRiskControlLogsPage(token, { cookieId = '', processingStatus = '', limit = 100, offset = 0 } = {}) {
+    let url = `/admin/risk-control-logs?limit=${limit}&offset=${offset}`;
+    if (cookieId) {
+        url += `&cookie_id=${encodeURIComponent(cookieId)}`;
+    }
+    if (processingStatus) {
+        url += `&processing_status=${encodeURIComponent(processingStatus)}`;
+    }
+
+    const response = await fetch(url, {
+        headers: {
+            'Authorization': `Bearer ${token}`
+        }
+    });
+
+    return response.json();
+}
+
+function needsClientSideRiskLogFilter(logs, processingStatus) {
+    if (!processingStatus || !Array.isArray(logs) || logs.length === 0) {
+        return false;
+    }
+
+    return logs.some(log => String(log.processing_status || '') !== processingStatus);
+}
+
+async function fetchRiskControlLogsWithClientFilter(token, { cookieId = '', processingStatus = '', limit = 100, offset = 0 } = {}) {
+    const batchSize = 500;
+    let fetchOffset = 0;
+    let total = 0;
+    const matchedLogs = [];
+
+    while (true) {
+        const pageData = await fetchRiskControlLogsPage(token, {
+            cookieId,
+            limit: batchSize,
+            offset: fetchOffset
+        });
+
+        const pageLogs = Array.isArray(pageData.data) ? pageData.data : [];
+        total = pageData.total || total || pageLogs.length;
+
+        matchedLogs.push(...pageLogs.filter(log => String(log.processing_status || '') === processingStatus));
+
+        fetchOffset += pageLogs.length;
+        if (pageLogs.length === 0 || fetchOffset >= total) {
+            break;
+        }
+    }
+
+    return {
+        success: true,
+        data: matchedLogs.slice(offset, offset + limit),
+        total: matchedLogs.length,
+        limit,
+        offset,
+        filter_mode: 'client'
+    };
+}
+
 // 加载风控日志
 async function loadRiskControlLogs(offset = 0) {
     const token = localStorage.getItem('auth_token');
     const cookieId = document.getElementById('riskLogCookieFilter').value;
-    const limit = document.getElementById('riskLogLimit').value;
+    const limit = parseInt(document.getElementById('riskLogLimit').value, 10) || 100;
+    currentRiskLogOffset = offset;
 
     const loadingDiv = document.getElementById('loadingRiskLogs');
     const logContainer = document.getElementById('riskLogContainer');
@@ -14221,19 +14620,23 @@ async function loadRiskControlLogs(offset = 0) {
     logContainer.style.display = 'none';
     noLogsDiv.style.display = 'none';
 
-    let url = `/admin/risk-control-logs?limit=${limit}&offset=${offset}`;
-    if (cookieId) {
-        url += `&cookie_id=${cookieId}`;
-    }
-
     try {
-        const response = await fetch(url, {
-            headers: {
-                'Authorization': `Bearer ${token}`
-            }
+        let data = await fetchRiskControlLogsPage(token, {
+            cookieId,
+            processingStatus: currentRiskLogStatus,
+            limit,
+            offset
         });
 
-        const data = await response.json();
+        if (needsClientSideRiskLogFilter(data.data, currentRiskLogStatus)) {
+            data = await fetchRiskControlLogsWithClientFilter(token, {
+                cookieId,
+                processingStatus: currentRiskLogStatus,
+                limit,
+                offset
+            });
+        }
+
         loadingDiv.style.display = 'none';
 
         if (data.success && data.data && data.data.length > 0) {
@@ -14244,13 +14647,22 @@ async function loadRiskControlLogs(offset = 0) {
         } else {
             noLogsDiv.style.display = 'block';
             updateRiskLogInfo({total: 0, data: []});
+            updateRiskLogPagination({total: 0});
         }
 
-        currentRiskLogOffset = offset;
     } catch (error) {
         console.error('加载风控日志失败:', error);
         loadingDiv.style.display = 'none';
         noLogsDiv.style.display = 'block';
+        updateRiskLogPagination({total: 0});
+        const countElement = document.getElementById('riskLogCount');
+        const paginationInfo = document.getElementById('riskLogPaginationInfo');
+        if (countElement) {
+            countElement.textContent = '加载失败';
+        }
+        if (paginationInfo) {
+            paginationInfo.textContent = '风控日志加载失败，请重试';
+        }
         showToast('加载风控日志失败', 'danger');
     }
 }
@@ -14316,15 +14728,26 @@ function displayRiskControlLogs(logs) {
 function updateRiskLogInfo(data) {
     const countElement = document.getElementById('riskLogCount');
     const paginationInfo = document.getElementById('riskLogPaginationInfo');
+    const cookieId = document.getElementById('riskLogCookieFilter')?.value;
+    const hasFilters = Boolean(cookieId || currentRiskLogStatus);
+    const total = data.total || 0;
+    const currentCount = data.data ? data.data.length : 0;
 
     if (countElement) {
-        countElement.textContent = `总计: ${data.total || 0} 条`;
+        countElement.textContent = hasFilters ? `筛选结果: ${total} 条` : `总计: ${total} 条`;
     }
 
     if (paginationInfo) {
+        if (currentCount === 0 || total === 0) {
+            paginationInfo.textContent = hasFilters ? `显示第 0-0 条，匹配 0 条记录` : '显示第 0-0 条，共 0 条记录';
+            return;
+        }
+
         const start = currentRiskLogOffset + 1;
-        const end = Math.min(currentRiskLogOffset + (data.data ? data.data.length : 0), data.total || 0);
-        paginationInfo.textContent = `显示第 ${start}-${end} 条，共 ${data.total || 0} 条记录`;
+        const end = Math.min(currentRiskLogOffset + currentCount, total);
+        paginationInfo.textContent = hasFilters
+            ? `显示第 ${start}-${end} 条，匹配 ${total} 条记录`
+            : `显示第 ${start}-${end} 条，共 ${total} 条记录`;
     }
 }
 
@@ -14372,7 +14795,10 @@ function filterRiskLogsByStatus(status) {
     document.querySelectorAll('.filter-badge[data-status]').forEach(badge => {
         badge.classList.remove('active');
     });
-    document.querySelector(`.filter-badge[data-status="${status}"]`).classList.add('active');
+    const activeBadge = document.querySelector(`.filter-badge[data-status="${status}"]`);
+    if (activeBadge) {
+        activeBadge.classList.add('active');
+    }
 
     // 重新加载日志
     loadRiskControlLogs(0);
@@ -14951,7 +15377,7 @@ function exportSearchResults() {
 
 
 // 默认版本号（当无法读取 version.txt 时使用）
-const DEFAULT_VERSION = 'v1.3.3';
+const DEFAULT_VERSION = 'v1.5.0';
 
 // 当前本地版本号（动态从 version.txt 读取）
 let LOCAL_VERSION = DEFAULT_VERSION;
@@ -14961,12 +15387,249 @@ let LOCAL_VERSION = DEFAULT_VERSION;
 
 // 缓存远程版本信息
 let remoteVersionInfo = null;
+const HOT_UPDATE_STORAGE_KEYS = {
+    autoCheckDisabled: 'hot_update_auto_check_disabled',
+    ignoredVersion: 'hot_update_ignored_version'
+};
+
+function isHotUpdateAutoCheckEnabled() {
+    return localStorage.getItem(HOT_UPDATE_STORAGE_KEYS.autoCheckDisabled) !== 'true';
+}
+
+function setHotUpdateAutoCheckEnabled(enabled) {
+    localStorage.setItem(HOT_UPDATE_STORAGE_KEYS.autoCheckDisabled, enabled ? 'false' : 'true');
+}
+
+function getIgnoredHotUpdateVersion() {
+    return localStorage.getItem(HOT_UPDATE_STORAGE_KEYS.ignoredVersion) || '';
+}
+
+function setIgnoredHotUpdateVersion(version) {
+    if (version) {
+        localStorage.setItem(HOT_UPDATE_STORAGE_KEYS.ignoredVersion, version);
+    }
+}
+
+function getHotUpdateTargetVersion(updateInfo = remoteVersionInfo) {
+    return updateInfo?.new_version || (updateInfo?.has_update ? updateInfo?.version : '') || '';
+}
+
+function shouldSuppressHotUpdateHint(updateInfo = remoteVersionInfo) {
+    const targetVersion = getHotUpdateTargetVersion(updateInfo);
+    return !isHotUpdateAutoCheckEnabled() || (!!targetVersion && getIgnoredHotUpdateVersion() === targetVersion);
+}
+
+function refreshHotUpdateButtonState(updateInfo = remoteVersionInfo) {
+    const dashboardHotUpdateGroup = document.getElementById('dashboardHotUpdateGroup');
+    const dashboardHotUpdateBtn = document.getElementById('dashboardHotUpdateBtn');
+    const dashboardHotUpdateMenuBtn = document.getElementById('dashboardHotUpdateMenuBtn');
+    if (!dashboardHotUpdateGroup || !dashboardHotUpdateBtn || !dashboardHotUpdateMenuBtn) return;
+
+    dashboardHotUpdateBtn.disabled = false;
+    dashboardHotUpdateBtn.innerHTML = '<i class="bi bi-cloud-download me-1"></i>检查更新';
+    dashboardHotUpdateMenuBtn.disabled = false;
+    dashboardHotUpdateGroup.classList.remove('has-update', 'is-loading');
+
+    const hasUpdate = Boolean(updateInfo && (updateInfo.has_update || updateInfo.new_version));
+    if (!hasUpdate || shouldSuppressHotUpdateHint(updateInfo)) {
+        return;
+    }
+
+    dashboardHotUpdateGroup.classList.add('has-update');
+    dashboardHotUpdateBtn.innerHTML = `<i class="bi bi-cloud-download me-1"></i>有新版本 ${getHotUpdateTargetVersion(updateInfo)}`;
+}
+
+function updateHotUpdatePreferenceStatus(message = '', type = 'info') {
+    if (message) {
+        showToast(message, type === 'success' ? 'success' : 'info');
+    }
+}
+
+function refreshHotUpdatePreferencesMenu() {
+    const autoCheckToggle = document.getElementById('dashboardHotUpdateAutoCheckToggle');
+    const ignoredVersionHint = document.getElementById('dashboardHotUpdatePreferenceHint');
+    const clearIgnoredBtn = document.getElementById('dashboardClearIgnoredVersionBtn');
+    const ignoredVersion = getIgnoredHotUpdateVersion();
+
+    if (autoCheckToggle) {
+        autoCheckToggle.textContent = isHotUpdateAutoCheckEnabled() ? '关闭自动检查' : '开启自动检查';
+    }
+
+    if (ignoredVersionHint) {
+        const autoCheckText = isHotUpdateAutoCheckEnabled() ? '自动检查：已开启' : '自动检查：已关闭';
+        ignoredVersionHint.textContent = ignoredVersion
+            ? `${autoCheckText} · 已忽略 ${ignoredVersion}`
+            : `${autoCheckText} · 当前未忽略任何版本`;
+    }
+
+    if (clearIgnoredBtn) {
+        clearIgnoredBtn.disabled = !ignoredVersion;
+    }
+}
+
+function toggleHotUpdateAutoCheck() {
+    const nextEnabled = !isHotUpdateAutoCheckEnabled();
+    setHotUpdateAutoCheckEnabled(nextEnabled);
+    refreshHotUpdatePreferencesMenu();
+    refreshHotUpdateButtonState();
+    updateHotUpdatePreferenceStatus(
+        nextEnabled
+            ? '自动检查更新已开启，当前浏览器进入系统时会自动检测'
+            : '自动检查更新已关闭，仍可手动点击“检查更新”',
+        'success'
+    );
+}
+
+function clearIgnoredUpdateVersion(showFeedback = true) {
+    localStorage.removeItem(HOT_UPDATE_STORAGE_KEYS.ignoredVersion);
+    refreshHotUpdatePreferencesMenu();
+    refreshHotUpdateButtonState();
+    if (showFeedback) {
+        updateHotUpdatePreferenceStatus('已清除忽略版本设置', 'success');
+    }
+}
 
 // 本地版本历史（远程服务禁用时使用）
 const LOCAL_VERSION_HISTORY = {
-    version: 'v1.3.3',
+    version: 'v1.6.0',
     intro: '本系统仅供个人学习研究使用，请勿用于商业用途。如有问题或建议，欢迎反馈。',
     versionHistory: [
+        {
+            version: 'v1.6.0',
+            date: '2026-03-12',
+            updates: [
+                '【修复】通知渠道邮件表单使用独立字段标识，避免与系统 SMTP 配置冲突后保存时误提示“请填写SMTP服务器”',
+                '【优化】通知渠道邮件标题与正文抬头统一为“闲鱼管理系统通知”，并精简验证码邮件文案',
+                '【优化】系统品牌文案统一调整为“闲鱼管理系统”，同步更新登录页、注册页、浏览器标题、API 文档与统计服务说明',
+                '【修复】风控日志记录数徽标文字垂直居中，处理状态筛选恢复可用，筛选结果与条数统计保持一致',
+                '【优化】风控验证通知文案调整为“自动回复功能暂时无法使用”，避免系统名与功能名混淆'
+            ]
+        },
+        {
+            version: 'v1.5.9',
+            date: '2026-03-11',
+            updates: [
+                '【修复】买家昵称过滤系统文案，避免订单和发货日志写入错误昵称',
+                '【修复】小刀订单商品归属增加回退校验，避免缓存未命中时误跳过自动发货',
+                '【修复】连续下单场景下旧关单消息串到新订单的问题',
+                '【修复】sid 简化消息将已处理订单误报为未找到订单的问题',
+                '【优化】前端时间显示与销售统计统一按北京时间口径处理'
+            ]
+        },
+        {
+            version: 'v1.5.8',
+            date: '2026-03-11',
+            updates: [
+                '【新功能】热更新弹窗新增“本次跳过”和“忽略此版本”，支持按版本跳过当前更新提示',
+                '【优化】仪表盘检查更新入口改为按钮组，新增自动检查开关和忽略版本管理，设置仅当前浏览器生效'
+            ]
+        },
+        {
+            version: 'v1.5.7',
+            date: '2026-03-11',
+            updates: [
+                '【修复】单规格订单自动发货改为优先精确匹配，精确规则未命中时支持降级到普通关键字规则',
+                '【优化】单规格降级兜底仅在唯一命中一条普通规则时放行，避免多规则误发',
+                '【优化】发货日志新增“单规兜底”标签，便于区分精确命中和普通规则兜底'
+            ]
+        },
+        {
+            version: 'v1.5.6',
+            date: '2026-03-11',
+            updates: [
+                '【修复】补发 captcha_control.html 热更新资源，避免 v1.5.5 下该文件因 Release 资源未刷新而反复提示更新',
+                '【优化】热更新检查日志改为汇总输出，不再逐文件打印“文件已是最新”'
+            ]
+        },
+        {
+            version: 'v1.5.5',
+            date: '2026-03-11',
+            updates: [
+                '【新功能】热更新清单改为自动扫描 Python、HTML、静态资源和前端源码文件，无需手动维护白名单',
+                '【新功能】新增发版预检查脚本，可在发布前检查版本号、改名/删除文件和未跟踪热更新文件',
+                '【新功能】热更新支持按清单删除旧文件，删除前会自动备份，降低改名和清理残留文件的风险',
+                '【优化】update_files.json 改为由 GitHub Actions 自动生成并上传到 Release，仓库内不再手动维护'
+            ]
+        },
+        {
+            version: 'v1.5.4',
+            date: '2026-03-10',
+            updates: [
+                '【修复】补充 .gitattributes 行尾规则，统一 Python、JS、HTML、CSS 等热更新相关文本文件使用 LF',
+                '【修复】避免因 CRLF/LF 行尾差异导致同版本下仍被误判为可热更新文件'
+            ]
+        },
+        {
+            version: 'v1.5.3',
+            date: '2026-03-10',
+            updates: [
+                '【修复】热更新执行权限改为按管理员身份校验，不再强依赖用户名必须为 admin',
+                '【修复】前端更新失败提示优先展示后端 detail 信息，避免只显示“未知错误”'
+            ]
+        },
+        {
+            version: 'v1.5.2',
+            date: '2026-03-10',
+            updates: [
+                '【新功能】GitHub Actions 在创建 Release 前自动生成并上传 update_files.json，无需手动维护更新清单',
+                '【优化】热更新检测前会实时刷新本地版本号，本地版本变更后无需重启服务即可重新检查更新',
+                '【修复】热更新执行权限改为按管理员身份判断，不再强依赖用户名必须为 admin',
+                '【修复】前端更新失败提示补充后端 detail 信息，避免只显示“未知错误”'
+            ]
+        },
+        {
+            version: 'v1.5.1',
+            date: '2026-03-10',
+            updates: [
+                '【新功能】接入 GitHub Releases 在线更新，支持从最新 Release 读取 update_files.json 检查热更新',
+                '【新功能】仪表盘版本区新增管理员可见的“检查更新”入口，可直接执行热更新',
+                '【优化】更新清单解析兼容 GitHub 资产返回 application/octet-stream 的场景，避免检查更新失败',
+                '【优化】版本区样式统一为 badge 视觉，并修复版本号与更新入口的垂直居中显示',
+                '【新功能】新增 GitHub Actions 自动发布工作流，push 到 main 且版本变化后可自动创建 tag 和 Release'
+            ]
+        },
+        {
+            version: 'v1.5.0',
+            date: '2026-03-10',
+            updates: [
+                '【新功能】Cookie、密码等敏感字段使用 Fernet 加密存储，启动时自动迁移历史明文数据',
+                '【新功能】多数量发货收尾状态机，消息发送与卡密消费/确认发货分阶段提交，避免脏数据',
+                '【新功能】批量数据卡密预占机制，发货前预占、发送后确认，启动时自动恢复过期预占',
+                '【新功能】发货进度追踪表，支持多数量订单分单元进度查询与状态聚合',
+                '【新功能】订单事件中心 OrderEventHub，按用户广播订单更新，支持 SSE 实时流推送',
+                '【新功能】仪表盘新增销售额统计面板与趋势曲线图，支持当日销售额显示及自动刷新（by @Mangor2021）',
+                '【新功能】添加卡券时可自动生成对应的发货规则（by @Mangor2021）',
+                '【优化】新增 partial_success（部分发货）和 partial_pending_finalize（部分待收尾）中间状态',
+                '【优化】退款撤销回退增强，新增 pre_refund_status 字段持久化退款前状态，支持跨重启回退',
+                '【优化】新增外部状态合并保护，防止粗粒度状态覆盖内部精细发货进度',
+                '【优化】规格识别容错增强，过滤备案信息、时间戳、URL 等误识别字段',
+                '【优化】订单缓存复用条件扩展为金额+状态+规格综合判断，减少不必要的浏览器抓取',
+                '【优化】账号列表接口不再返回完整 Cookie 和密码原文，改为脱敏展示',
+                '【优化】销售额数据按用户账号隔离，修复多用户场景下数据串读',
+                '【优化】发货日志记录拼接规格模式上下文，便于排查',
+                '【优化】新增 message_hash + 强关联键精准消息匹配框架',
+                '【优化】发货成功后激活订单级延迟锁，防止短时间内重复发货',
+                '【优化】销售额曲线变化增加平滑过渡动画，时间按钮改为属性匹配（by @Mangor2021）',
+                '【修复】自动确认发货 Session 跨事件循环复用导致 timeout 错误，改为每次创建独立 Session',
+                '【修复】自动确认发货请求沿用主实例 HTTP 代理配置',
+                '【修复】前端 showToast 从 innerHTML 改为 DOM 构建，防止 XSS 注入',
+                '【修复】账号编辑与默认回复模态框 DOM ID 冲突导致数据串写',
+                '【修复】复制 Cookie 改为按需 API 获取，列表页不再暴露原文',
+                '【修复】前端订单状态筛选项与后端状态体系对齐',
+                '【修复】批量删除按钮默认 disabled，全选复选框 ID 修正',
+                '【修复】增加系统消息过滤关键字，修复商品信息变更后误触发自动回复（by @Mangor2021）'
+            ]
+        },
+        {
+            version: 'v1.3.4',
+            date: '2026-03-03',
+            updates: [
+                '【优化】无规格商品自动发货改为单次详情尝试并强制按普通规则匹配，避免误识别规格干扰',
+                '【优化】规格商品在缺失规格时新增“唯一规则安全兜底”，仅唯一命中时放行，提升单规格场景成功率',
+                '【修复】规格匹配失败后的普通规则兜底查询补充 user_id 过滤，避免跨账号规则误命中',
+                '【修复】补充 pending_payment 内部状态映射，减少未映射状态告警'
+            ]
+        },
         {
             version: 'v1.3.3',
             date: '2026-03-03',
@@ -15220,7 +15883,7 @@ const LOCAL_VERSION_HISTORY = {
             version: 'v1.0.0',
             date: '2026-01-24',
             updates: [
-                '闲鱼自动回复系统初始版本'
+                '闲鱼管理系统初始版本'
             ]
         }
     ]
@@ -15254,41 +15917,21 @@ async function loadSystemVersion() {
             systemVersionBadge.onclick = () => showChangelogModal();
         }
 
-        // 从远程PHP获取版本信息（暂时禁用）
-        // try {
-        //     const response = await fetch(VERSION_CHECK_URL, {
-        //         method: 'GET',
-        //         headers: {
-        //             'Accept': 'application/json'
-        //         }
-        //     });
-        //
-        //     if (!response.ok) {
-        //         console.warn('版本检查请求失败:', response.status);
-        //         return;
-        //     }
-        //
-        //     const result = await response.json();
-        //
-        //     if (result.error || !result.success) {
-        //         console.warn('版本检查返回错误:', result.message);
-        //         return;
-        //     }
-        //
-        //     // 缓存远程版本信息
-        //     remoteVersionInfo = result.data;
-        //
-        //     // 检查是否有更新（版本号不一致）
-        //     if (remoteVersionInfo.version && remoteVersionInfo.version !== LOCAL_VERSION) {
-        //         showUpdateAvailable(remoteVersionInfo.version);
-        //     }
-        //
-        // } catch (fetchError) {
-        //     console.warn('无法连接版本检查服务器:', fetchError.message);
-        // }
+        refreshHotUpdateButtonState();
 
-        // 使用本地版本历史
-        remoteVersionInfo = LOCAL_VERSION_HISTORY;
+        if (!isHotUpdateAutoCheckEnabled()) {
+            return;
+        }
+
+        // 调用后端检查更新（复用热更新接口）
+        try {
+            const checkResult = await checkHotUpdate();
+            if (checkResult && checkResult.has_update) {
+                refreshHotUpdateButtonState(checkResult);
+            }
+        } catch (e) {
+            console.warn('版本检查失败:', e.message);
+        }
 
     } catch (error) {
         console.error('版本加载失败:', error);
@@ -15297,76 +15940,26 @@ async function loadSystemVersion() {
 }
 
 /**
- * 显示有更新标签（暂时禁用）
- */
-// function showUpdateAvailable(newVersion) {
-//     const versionContainer = document.querySelector('.version-info');
-//
-//     if (!versionContainer) {
-//         return;
-//     }
-//
-//     // 检查是否已经有更新标签
-//     if (versionContainer.querySelector('.update-badge')) {
-//         return;
-//     }
-//
-//     // 创建更新标签
-//     const updateBadge = document.createElement('span');
-//     updateBadge.className = 'badge bg-warning ms-2 update-badge';
-//     updateBadge.style.cursor = 'pointer';
-//     updateBadge.innerHTML = '<i class="bi bi-arrow-up-circle me-1"></i>有更新';
-//     updateBadge.title = `新版本 ${newVersion} 可用，点击查看更新内容`;
-//
-//     // 点击事件
-//     updateBadge.onclick = () => showUpdateInfo(newVersion);
-//
-//     // 添加到版本信息容器
-//     versionContainer.appendChild(updateBadge);
-// }
-
-/**
  * 获取更新信息（使用缓存或本地版本历史）
  */
 async function getUpdateInfo() {
-    // 如果已有缓存的远程版本信息，直接使用
+    // 如果已有缓存的远程版本信息，映射为前端期望的字段格式
     if (remoteVersionInfo) {
-        return remoteVersionInfo;
+        return {
+            version: remoteVersionInfo.new_version || remoteVersionInfo.version,
+            updates: remoteVersionInfo.changelog || remoteVersionInfo.updates,
+            description: remoteVersionInfo.description,
+            releaseDate: remoteVersionInfo.release_date || remoteVersionInfo.releaseDate,
+            downloadUrl: remoteVersionInfo.downloadUrl,
+            altDownloadUrl: remoteVersionInfo.altDownloadUrl,
+            installMethods: remoteVersionInfo.installMethods,
+            notice: remoteVersionInfo.notice
+        };
     }
 
-    // 使用本地版本历史（远程服务暂时禁用）
+    // 使用本地版本历史作为兜底
     remoteVersionInfo = LOCAL_VERSION_HISTORY;
     return remoteVersionInfo;
-
-    // 远程请求代码（暂时禁用）
-    // try {
-    //     const response = await fetch(VERSION_CHECK_URL, {
-    //         method: 'GET',
-    //         headers: {
-    //             'Accept': 'application/json'
-    //         }
-    //     });
-    //
-    //     if (!response.ok) {
-    //         showToast('获取更新信息失败: 网络错误', 'danger');
-    //         return null;
-    //     }
-    //
-    //     const result = await response.json();
-    //
-    //     if (result.error || !result.success) {
-    //         showToast('获取更新信息失败: ' + (result.message || '未知错误'), 'danger');
-    //         return null;
-    //     }
-    //
-    //     remoteVersionInfo = result.data;
-    //     return remoteVersionInfo;
-    //
-    // } catch (error) {
-    //     console.error('获取更新信息失败:', error);
-    //     showToast('获取更新信息失败: ' + error.message, 'danger');
-    //     return null;
-    // }
 }
 
 /**
@@ -16196,7 +16789,7 @@ async function showVersionInfo(version) {
                         <div class="text-center mt-4">
                             <small style="color: #888; font-size: 14px;">
                                 <i class="bi bi-github me-1"></i>
-                                闲鱼自动回复助手 | 让客服工作更轻松
+                                闲鱼管理系统 | 让店铺管理更轻松
                             </small>
                         </div>
                     </div>
@@ -16257,6 +16850,10 @@ async function checkHotUpdate() {
             console.warn('热更新检查返回错误:', result.message);
             return null;
         }
+
+        if (result.data) {
+            remoteVersionInfo = result.data;
+        }
         
         return result.data;
         
@@ -16271,13 +16868,7 @@ async function checkHotUpdate() {
  * 下载并安装所有可用更新
  */
 async function performHotUpdate() {
-    const hotUpdateBtn = document.getElementById('hotUpdateBtn');
-    
-    // 禁用按钮，显示加载状态
-    if (hotUpdateBtn) {
-        hotUpdateBtn.disabled = true;
-        hotUpdateBtn.innerHTML = '<i class="bi bi-arrow-repeat spin me-1"></i>检查更新中...';
-    }
+    setHotUpdateButtonsLoading();
     
     try {
         // 先检查是否有更新
@@ -16296,9 +16887,16 @@ async function performHotUpdate() {
         }
         
         // 显示确认对话框
-        const confirmed = await showHotUpdateConfirmDialog(checkResult);
+        const dialogAction = await showHotUpdateConfirmDialog(checkResult);
         
-        if (!confirmed) {
+        if (dialogAction !== 'confirm') {
+            if (dialogAction === 'ignore') {
+                const ignoredVersion = getHotUpdateTargetVersion(checkResult);
+                setIgnoredHotUpdateVersion(ignoredVersion);
+                refreshHotUpdatePreferencesMenu();
+                refreshHotUpdateButtonState(checkResult);
+                updateHotUpdatePreferenceStatus(`已忽略版本 ${ignoredVersion}`, 'success');
+            }
             resetHotUpdateBtn();
             return;
         }
@@ -16324,13 +16922,15 @@ async function performHotUpdate() {
         if (result.success && result.data.success) {
             // 更新成功
             const updateData = result.data;
+            const updatedCount = updateData.updated_files?.length || 0;
+            const deletedCount = updateData.deleted_files?.length || 0;
             
             if (updateData.needs_restart) {
                 // 需要重启
                 showHotUpdateRestartDialog(updateData);
             } else {
                 // 不需要重启，刷新页面即可
-                showToast(`更新成功！共更新 ${updateData.updated_files.length} 个文件`, 'success');
+                showToast(`更新成功！更新 ${updatedCount} 个文件，删除 ${deletedCount} 个旧文件`, 'success');
                 
                 // 3秒后刷新页面
                 setTimeout(() => {
@@ -16338,7 +16938,7 @@ async function performHotUpdate() {
                 }, 3000);
             }
         } else {
-            showToast('更新失败: ' + (result.message || result.data?.message || '未知错误'), 'danger');
+            showToast('更新失败: ' + (result.detail || result.message || result.data?.message || '未知错误'), 'danger');
         }
         
     } catch (error) {
@@ -16359,6 +16959,28 @@ function resetHotUpdateBtn() {
         hotUpdateBtn.disabled = false;
         hotUpdateBtn.innerHTML = '<i class="bi bi-cloud-download me-1"></i>一键热更新';
     }
+    refreshHotUpdateButtonState();
+}
+
+function setHotUpdateButtonsLoading() {
+    const hotUpdateBtn = document.getElementById('hotUpdateBtn');
+    if (hotUpdateBtn) {
+        hotUpdateBtn.disabled = true;
+        hotUpdateBtn.innerHTML = '<i class="bi bi-arrow-repeat spin me-1"></i>检查更新中...';
+    }
+    const dashboardHotUpdateGroup = document.getElementById('dashboardHotUpdateGroup');
+    const dashboardHotUpdateBtn = document.getElementById('dashboardHotUpdateBtn');
+    const dashboardHotUpdateMenuBtn = document.getElementById('dashboardHotUpdateMenuBtn');
+    if (dashboardHotUpdateBtn) {
+        dashboardHotUpdateBtn.disabled = true;
+        dashboardHotUpdateBtn.innerHTML = '<i class="bi bi-arrow-repeat spin me-1"></i>检查更新中...';
+    }
+    if (dashboardHotUpdateMenuBtn) {
+        dashboardHotUpdateMenuBtn.disabled = true;
+    }
+    if (dashboardHotUpdateGroup) {
+        dashboardHotUpdateGroup.classList.add('is-loading');
+    }
 }
 
 /**
@@ -16368,9 +16990,25 @@ async function showHotUpdateConfirmDialog(updateInfo) {
     return new Promise((resolve) => {
         const filesInfo = updateInfo.files && updateInfo.files.length > 0
             ? updateInfo.files.map(f => `<li><code>${f.path}</code> ${f.requires_restart ? '<span class="badge bg-warning">需重启</span>' : ''}</li>`).join('')
-            : '<li>暂无详细文件列表</li>';
+            : '<li>本次无新增或覆盖文件</li>';
+        const deletedFilesInfo = updateInfo.deleted_files && updateInfo.deleted_files.length > 0
+            ? updateInfo.deleted_files.map(f => `<li><code>${f.path}</code> ${f.requires_restart ? '<span class="badge bg-warning">需重启</span>' : ''}</li>`).join('')
+            : '';
         
         const totalSizeKB = (updateInfo.total_size / 1024).toFixed(2);
+        const deletedCount = updateInfo.deleted_files_count || 0;
+        const deleteSection = deletedCount > 0 ? `
+                            <div class="mb-3">
+                                <div style="color: #444; font-size: 14px; font-weight: 600; margin-bottom: 8px;">
+                                    <i class="bi bi-trash me-1"></i>将删除以下旧文件：
+                                </div>
+                                <div style="max-height: 120px; overflow-y: auto; background: #fff3f3; border-radius: 8px; padding: 12px; border: 1px solid #f5c2c7;">
+                                    <ul class="list-unstyled mb-0" style="font-size: 13px;">
+                                        ${deletedFilesInfo}
+                                    </ul>
+                                </div>
+                            </div>
+        ` : '';
         
         const modalHtml = `
             <div class="modal fade" id="hotUpdateConfirmModal" tabindex="-1">
@@ -16400,6 +17038,10 @@ async function showHotUpdateConfirmDialog(updateInfo) {
                                     <span style="color: #666;"><i class="bi bi-files me-1"></i>更新文件数</span>
                                     <span style="font-weight: 600; color: #333;">${updateInfo.files_count} 个</span>
                                 </div>
+                                <div class="d-flex justify-content-between align-items-center mb-2">
+                                    <span style="color: #666;"><i class="bi bi-trash me-1"></i>删除旧文件数</span>
+                                    <span style="font-weight: 600; color: #333;">${deletedCount} 个</span>
+                                </div>
                                 <div class="d-flex justify-content-between align-items-center">
                                     <span style="color: #666;"><i class="bi bi-hdd me-1"></i>下载大小</span>
                                     <span style="font-weight: 600; color: #333;">${totalSizeKB} KB</span>
@@ -16416,18 +17058,22 @@ async function showHotUpdateConfirmDialog(updateInfo) {
                                     </ul>
                                 </div>
                             </div>
+                            ${deleteSection}
                             
                             <div class="rounded-3 p-3" style="background: linear-gradient(135deg, #fff3cd, #ffeeba); color: #856404; font-size: 14px;">
                                 <i class="bi bi-exclamation-triangle me-2"></i>
-                                <strong>提示：</strong>更新前会自动备份原文件，如遇问题可恢复。
+                                <strong>提示：</strong>更新和删除前都会自动备份原文件，如遇问题可恢复。
                             </div>
                         </div>
                         <div class="modal-footer py-3" style="background: #fff; border-top: 1px solid #e8ecf0;">
+                            <button type="button" class="btn btn-link text-decoration-none me-auto px-0" style="color: #6c757d;" id="hotUpdateIgnoreBtn">
+                                忽略此版本
+                            </button>
                             <button type="button" class="btn" style="background: #f0f0f0; color: #666; border: none; font-size: 15px; padding: 8px 20px;" data-bs-dismiss="modal" id="hotUpdateCancelBtn">
-                                取消
+                                本次跳过
                             </button>
                             <button type="button" class="btn" style="background: linear-gradient(135deg, #28a745, #20c997); color: #fff; border: none; font-size: 15px; padding: 8px 20px;" id="hotUpdateConfirmBtn">
-                                <i class="bi bi-check-lg me-1"></i>确认更新
+                                <i class="bi bi-check-lg me-1"></i>立即更新
                             </button>
                         </div>
                     </div>
@@ -16443,21 +17089,36 @@ async function showHotUpdateConfirmDialog(updateInfo) {
         
         document.body.insertAdjacentHTML('beforeend', modalHtml);
         
-        const modal = new bootstrap.Modal(document.getElementById('hotUpdateConfirmModal'));
+        const modalElement = document.getElementById('hotUpdateConfirmModal');
+        const modal = new bootstrap.Modal(modalElement);
+        let resolved = false;
+
+        const finish = (action) => {
+            if (resolved) return;
+            resolved = true;
+            modal.hide();
+            resolve(action);
+        };
         
         // 绑定按钮事件
         document.getElementById('hotUpdateConfirmBtn').onclick = () => {
-            modal.hide();
-            resolve(true);
+            finish('confirm');
         };
         
         document.getElementById('hotUpdateCancelBtn').onclick = () => {
-            modal.hide();
-            resolve(false);
+            finish('skip');
+        };
+
+        document.getElementById('hotUpdateIgnoreBtn').onclick = () => {
+            finish('ignore');
         };
         
-        document.getElementById('hotUpdateConfirmModal').addEventListener('hidden.bs.modal', () => {
-            document.getElementById('hotUpdateConfirmModal').remove();
+        modalElement.addEventListener('hidden.bs.modal', () => {
+            modalElement.remove();
+            if (!resolved) {
+                resolved = true;
+                resolve('skip');
+            }
         });
         
         modal.show();
@@ -16650,9 +17311,8 @@ async function loadImAccountList() {
                     const option = document.createElement('option');
                     option.value = account.id;
                     option.textContent = account.id;
-                    // 存储用户名和密码在data属性中
+                    // 仅缓存非敏感账号信息，敏感字段按需拉取
                     option.dataset.username = account.username || '';
-                    option.dataset.password = account.password || '';
                     select.appendChild(option);
                 });
             }
@@ -16667,7 +17327,24 @@ async function loadImAccountList() {
 /**
  * 账号选择变化时的处理
  */
-function onImAccountChange() {
+async function fetchImAccountDetails(accountId) {
+    const response = await fetch(`${apiBase}/cookie/${encodeURIComponent(accountId)}/details?include_secrets=true`, {
+        headers: {
+            'Authorization': `Bearer ${authToken}`
+        }
+    });
+
+    if (!response.ok) {
+        throw new Error('获取账号详情失败');
+    }
+
+    return await response.json();
+}
+
+/**
+ * 账号选择变化时的处理
+ */
+async function onImAccountChange() {
     const select = document.getElementById('imAccountSelect');
     const usernameEl = document.getElementById('imDisplayUsername');
     const passwordEl = document.getElementById('imDisplayPassword');
@@ -16678,12 +17355,24 @@ function onImAccountChange() {
 
     if (selectedOption && selectedOption.value) {
         const username = selectedOption.dataset.username || '未配置';
-        const password = selectedOption.dataset.password || '';
 
         if (usernameEl) usernameEl.textContent = username;
-        // 密码显示为密文样式
         if (passwordEl) {
-            passwordEl.textContent = password ? '••••••••' : '未配置';
+            passwordEl.textContent = '加载中...';
+        }
+
+        try {
+            const details = await fetchImAccountDetails(selectedOption.value);
+            const password = details.password || '';
+            if (passwordEl) {
+                passwordEl.textContent = password ? '••••••••' : '未配置';
+            }
+        } catch (error) {
+            if (passwordEl) {
+                passwordEl.textContent = '获取失败';
+            }
+            console.error('获取IM账号详情失败:', error);
+            showToast('获取账号密码失败，请稍后重试', 'warning');
         }
     } else {
         // 未选择账号时显示默认值
@@ -16722,8 +17411,16 @@ async function copyImPassword() {
         return;
     }
 
-    const selectedOption = select.selectedOptions[0];
-    const password = selectedOption.dataset.password || '';
+    let password = '';
+
+    try {
+        const details = await fetchImAccountDetails(select.value);
+        password = details.password || '';
+    } catch (error) {
+        console.error('获取密码失败:', error);
+        showToast('获取密码失败，请稍后重试', 'danger');
+        return;
+    }
 
     if (!password || password === '未配置') {
         showToast('密码未配置', 'warning');
@@ -16772,7 +17469,16 @@ async function copyImAccountInfo() {
 
     const selectedOption = select.selectedOptions[0];
     const username = selectedOption.dataset.username || '';
-    const password = selectedOption.dataset.password || '';
+    let password = '';
+
+    try {
+        const details = await fetchImAccountDetails(select.value);
+        password = details.password || '';
+    } catch (error) {
+        console.error('获取账号密码失败:', error);
+        showToast('获取账号密码失败，请稍后重试', 'danger');
+        return;
+    }
 
     if (!username && !password) {
         showToast('该账号未配置用户名和密码', 'warning');

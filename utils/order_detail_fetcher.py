@@ -34,6 +34,30 @@ if os.getenv('DOCKER_ENV'):
         logger.warning(f"设置SelectorEventLoop失败: {e}")
 
 
+def _normalize_cached_amount(amount: Any) -> Optional[float]:
+    if amount in (None, ''):
+        return None
+
+    amount_clean = str(amount).replace('¥', '').replace('￥', '').replace('$', '').strip()
+    try:
+        return float(amount_clean)
+    except (ValueError, TypeError):
+        return None
+
+
+def _should_use_cached_order(existing_order: Dict[str, Any]) -> bool:
+    if not existing_order:
+        return False
+
+    amount_value = _normalize_cached_amount(existing_order.get('amount'))
+    amount_valid = amount_value is not None and amount_value > 0
+    has_valid_spec = bool((existing_order.get('spec_name') or '').strip() and (existing_order.get('spec_value') or '').strip())
+    status_value = str(existing_order.get('order_status') or '').strip().lower()
+    status_valid = bool(status_value and status_value not in ('unknown', 'processing'))
+
+    return amount_valid and (status_valid or has_valid_spec)
+
+
 class OrderDetailFetcher:
     """闲鱼订单详情获取器"""
 
@@ -223,20 +247,9 @@ class OrderDetailFetcher:
                     existing_order = db_manager.get_order_by_id(order_id)
 
                     if existing_order:
-                        # 检查金额字段是否有效（不为空且不为0）
                         amount = existing_order.get('amount', '')
-                        amount_valid = False
 
-                        if amount:
-                            # 移除可能的货币符号和空格，检查是否为有效数字
-                            amount_clean = str(amount).replace('¥', '').replace('￥', '').replace('$', '').strip()
-                            try:
-                                amount_value = float(amount_clean)
-                                amount_valid = amount_value > 0
-                            except (ValueError, TypeError):
-                                amount_valid = False
-
-                        if amount_valid:
+                        if _should_use_cached_order(existing_order):
                             logger.info(f"📋 订单 {order_id} 已存在于数据库中且金额有效({amount})，直接返回缓存数据")
                             print(f"✅ 订单 {order_id} 使用缓存数据，跳过浏览器获取")
 
@@ -264,8 +277,8 @@ class OrderDetailFetcher:
                             }
                             return result
                         else:
-                            logger.info(f"📋 订单 {order_id} 存在于数据库中但金额无效({amount})，需要重新获取")
-                            print(f"⚠️ 订单 {order_id} 金额无效，重新获取详情...")
+                            logger.info(f"📋 订单 {order_id} 缓存字段不完整或状态无效，重新获取详情: amount={amount}, status={existing_order.get('order_status')}")
+                            print(f"⚠️ 订单 {order_id} 缓存不满足复用条件，重新获取详情...")
                 else:
                     logger.info(f"🔄 订单 {order_id} 强制刷新模式，跳过缓存检查")
 
@@ -575,6 +588,99 @@ class OrderDetailFetcher:
         except (ValueError, TypeError):
             return False
 
+    def _is_datetime_like(self, text: str) -> bool:
+        """判断文本是否明显像时间/日期，而非规格。"""
+        if not text:
+            return False
+        normalized = str(text).strip()
+        if not normalized:
+            return False
+
+        datetime_patterns = [
+            r'^\d{4}[-/]\d{1,2}[-/]\d{1,2}$',
+            r'^\d{1,2}:\d{2}(:\d{2})?$',
+            r'^\d{4}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}(:\d{2})?$',
+            r'^\d{10,13}$',
+        ]
+        return any(re.match(pattern, normalized) for pattern in datetime_patterns)
+
+    def _is_valid_spec_candidate(self, spec_name: str, spec_value: str) -> bool:
+        """校验规格候选是否可信，过滤备案信息/时间等误命中。"""
+        name = (spec_name or '').strip()
+        value = (spec_value or '').strip()
+
+        if not name or not value:
+            return False
+
+        # 键名过长通常是正文信息，不是规格名称
+        if len(name) > 20:
+            return False
+
+        # 时间戳/日期误识别
+        if self._is_datetime_like(name) or self._is_datetime_like(value):
+            return False
+
+        # URL/协议字段不是规格
+        invalid_protocol_tokens = ['http://', 'https://', 'fleamarket://']
+        if any(token in name.lower() for token in invalid_protocol_tokens):
+            return False
+        if any(token in value.lower() for token in invalid_protocol_tokens):
+            return False
+
+        # 过滤常见平台资质、订单流程字段
+        invalid_tokens = [
+            '统一社会信用代码', '许可证', '备案', '经营', '广播电视节目',
+            '营业性演出', '集邮市场', '增值电信', 'app备案号',
+            '订单号', '付款', '交易', '退款', '发货', '收货',
+            '买家', '卖家', '地址', '电话', '手机号', '快递', '物流',
+            '创建时间', '付款时间', '成交时间', '下单时间'
+        ]
+        lower_name = name.lower()
+        lower_value = value.lower()
+        if any(token in lower_name for token in invalid_tokens):
+            return False
+        if any(token in lower_value for token in invalid_tokens):
+            return False
+
+        return True
+
+    def _sanitize_sku_result(self, sku_info: Dict[str, str], source: str = "unknown") -> Dict[str, str]:
+        """清洗SKU结果中的可疑规格字段，避免误发。"""
+        if not sku_info:
+            return sku_info
+
+        result = dict(sku_info)
+
+        spec_name = (result.get('spec_name') or '').strip()
+        spec_value = (result.get('spec_value') or '').strip()
+        spec_name_2 = (result.get('spec_name_2') or '').strip()
+        spec_value_2 = (result.get('spec_value_2') or '').strip()
+
+        primary_valid = self._is_valid_spec_candidate(spec_name, spec_value)
+        secondary_valid = self._is_valid_spec_candidate(spec_name_2, spec_value_2) if (spec_name_2 or spec_value_2) else False
+
+        if not primary_valid and (spec_name or spec_value):
+            logger.warning(
+                f"过滤疑似误识别规格(primary, source={source}): {spec_name}:{spec_value}"
+            )
+            result.pop('spec_name', None)
+            result.pop('spec_value', None)
+
+        if not secondary_valid and (spec_name_2 or spec_value_2):
+            logger.warning(
+                f"过滤疑似误识别规格(secondary, source={source}): {spec_name_2}:{spec_value_2}"
+            )
+            result.pop('spec_name_2', None)
+            result.pop('spec_value_2', None)
+
+        # 如果主规格被清掉而次规格有效，则提升次规格为主规格
+        if ('spec_name' not in result or not result.get('spec_name')) and result.get('spec_name_2') and result.get('spec_value_2'):
+            result['spec_name'] = result.pop('spec_name_2')
+            result['spec_value'] = result.pop('spec_value_2')
+            logger.info(f"规格清洗后提升次规格为主规格(source={source})")
+
+        return result
+
     def _extract_status_from_text(self, text: str) -> str:
         """从任意文本中提取订单状态"""
         if not text:
@@ -585,7 +691,7 @@ class OrderDetailFetcher:
             ('交易关闭', 'closed'),
             ('已关闭', 'closed'),
             ('待付款', 'pending_payment'),
-            ('待发货', 'pending_delivery'),
+            ('待发货', 'pending_ship'),
             ('已发货', 'shipped'),
             ('待收货', 'shipped'),
             ('退款中', 'refunding'),
@@ -647,9 +753,10 @@ class OrderDetailFetcher:
             'http://', 'https://', 'fleamarket://', '订单', '买家', '卖家', '地址',
             '手机', '电话', '时间', '发货', '付款', '交易', '退款', '去发货', '修改价格',
             '等待你发货', '等待买家', '已发货', '待收货', '待发货',
-            # 新增：过滤备案信息
+# 新增：过滤备案信息
             '统一社会信用代码', '增值电信', '许可证', '备案', 'ICP', '营业执照',
-            '广播电视', '演出许可', '集邮', 'APP备案', '网络食品', '食品经营'
+            '广播电视', '广播电视节目', '演出许可', '营业性演出', '集邮', '集邮市场',
+            'APP备案', 'app备案号', '网络食品', '食品经营', '经营'
         ]
 
         for line in lines:
@@ -669,7 +776,9 @@ class OrderDetailFetcher:
 
             parsed = self._parse_sku_content(f"{left}:{right}")
             if parsed:
-                spec_candidates.append(parsed)
+                sanitized_candidate = self._sanitize_sku_result(parsed, source="text_fallback_candidate")
+                if sanitized_candidate.get('spec_name') and sanitized_candidate.get('spec_value'):
+                    spec_candidates.append(sanitized_candidate)
 
         if spec_candidates:
             primary = spec_candidates[0]
@@ -686,7 +795,7 @@ class OrderDetailFetcher:
                     result['spec_name_2'] = second['spec_name']
                     result['spec_value_2'] = second['spec_value']
 
-        return result
+        return self._sanitize_sku_result(result, source="text_fallback_result")
 
     def _is_order_detail_parse_success(self, sku_info: Optional[Dict[str, str]], order_status: str) -> bool:
         """判定订单详情解析是否成功（金额/规格/状态任一有效即可）"""
@@ -752,7 +861,7 @@ class OrderDetailFetcher:
             - 'success': 交易成功
             - 'closed': 交易关闭
             - 'pending_payment': 待付款
-            - 'pending_delivery': 待发货
+            - 'pending_ship': 待发货
             - 'shipped': 已发货/待收货
             - 'refunding': 退款中
             - 'unknown': 未知状态
@@ -953,6 +1062,12 @@ class OrderDetailFetcher:
             if 'quantity' not in result:
                 result['quantity'] = '1'
                 logger.info("未获取到数量信息，默认设置为1")
+
+            # 对最终规格做二次清洗，防止主通道/兜底误识别正文字段
+            cleaned_result = self._sanitize_sku_result(result, source="sku_final")
+            if cleaned_result != result:
+                logger.warning(f"SKU结果已清洗: before={result}, after={cleaned_result}")
+            result = cleaned_result
 
             # 打印最终结果
             if result:
@@ -1188,19 +1303,9 @@ async def fetch_order_detail_simple(
             existing_order = db_manager.get_order_by_id(order_id)
 
             if existing_order:
-                # 检查金额字段是否有效
                 amount = existing_order.get('amount', '')
-                amount_valid = False
 
-                if amount:
-                    amount_clean = str(amount).replace('¥', '').replace('￥', '').replace('$', '').strip()
-                    try:
-                        amount_value = float(amount_clean)
-                        amount_valid = amount_value > 0
-                    except (ValueError, TypeError):
-                        amount_valid = False
-
-                if amount_valid:
+                if _should_use_cached_order(existing_order):
                     logger.info(f"📋 订单 {order_id} 已存在于数据库中且金额有效({amount})，直接返回缓存数据")
                     print(f"✅ 订单 {order_id} 使用缓存数据，跳过浏览器获取")
 
@@ -1229,8 +1334,8 @@ async def fetch_order_detail_simple(
                     }
                     return result
                 else:
-                    logger.info(f"📋 订单 {order_id} 存在于数据库中但金额无效({amount})，需要重新获取")
-                    print(f"⚠️ 订单 {order_id} 金额无效，重新获取详情...")
+                    logger.info(f"📋 订单 {order_id} 缓存字段不完整或状态无效，重新获取详情: amount={amount}, status={existing_order.get('order_status')}")
+                    print(f"⚠️ 订单 {order_id} 缓存不满足复用条件，重新获取详情...")
         except Exception as e:
             logger.warning(f"检查数据库缓存失败: {e}")
     else:

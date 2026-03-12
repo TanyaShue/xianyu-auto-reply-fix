@@ -8,6 +8,11 @@ entrypoint.sh text eol=lf
 # 确保Python文件使用Unix换行符(LF)
 *.py text eol=lf
 
+# 确保前端文件使用Unix换行符(LF)
+*.js text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+
 # 确保配置文件使用Unix换行符(LF)
 *.yml text eol=lf
 *.yaml text eol=lf

@@ -216,10 +216,36 @@
             <p class="text-muted mb-0">系统概览和统计信息</p>
           </div>
           <div class="version-info d-flex gap-2">
-            <span class="badge bg-secondary" id="systemVersion" style="cursor: pointer;" onclick="showChangelogModal()" title="点击查看更新日志">
+            <span class="badge d-inline-flex align-items-center version-pill" id="systemVersion" onclick="showChangelogModal()" title="点击查看更新日志">
               <i class="bi bi-info-circle me-1"></i>
               版本: <span id="versionNumber">加载中...</span>
             </span>
+            <div class="btn-group dashboard-hot-update-group" id="dashboardHotUpdateGroup" style="display: none;">
+              <button type="button" class="btn btn-sm dashboard-hot-update-btn d-inline-flex align-items-center" id="dashboardHotUpdateBtn" onclick="performHotUpdate()">
+                <i class="bi bi-cloud-download me-1"></i>检查更新
+              </button>
+              <button type="button" class="btn btn-sm dashboard-hot-update-menu-btn dropdown-toggle dropdown-toggle-split" id="dashboardHotUpdateMenuBtn" data-bs-toggle="dropdown" aria-expanded="false">
+                <span class="visually-hidden">切换更新菜单</span>
+              </button>
+              <ul class="dropdown-menu dropdown-menu-end shadow-sm dashboard-hot-update-dropdown">
+                <li>
+                  <button type="button" class="dropdown-item" id="dashboardHotUpdateAutoCheckToggle" onclick="toggleHotUpdateAutoCheck()">
+                    关闭自动检查
+                  </button>
+                </li>
+                <li>
+                  <button type="button" class="dropdown-item" id="dashboardClearIgnoredVersionBtn" onclick="clearIgnoredUpdateVersion()">
+                    清除忽略版本
+                  </button>
+                </li>
+                <li><hr class="dropdown-divider"></li>
+                <li>
+                  <div class="dropdown-item-text small text-muted" id="dashboardHotUpdatePreferenceHint">
+                    当前浏览器生效
+                  </div>
+                </li>
+              </ul>
+            </div>
             <!-- 最新权益功能暂时隐藏
             <span class="badge bg-gradient" id="benefitsBadge" style="cursor: pointer; background: linear-gradient(135deg, #ff6b6b, #feca57, #48dbfb) !important; color: #fff; animation: benefitsGlow 2s ease-in-out infinite;" onclick="showBenefitsModal()">
               <i class="bi bi-gift me-1"></i>
@@ -685,11 +711,6 @@
               </div>
             </div>
 
-            <!-- 搜索结果统计 -->
-            <div id="itemSearchStats" class="text-muted small" style="display: none;">
-              <i class="bi bi-search me-1"></i>
-              <span id="itemSearchStatsText"></span>
-            </div>
           </div>
         </div>
 
@@ -799,18 +820,13 @@
           <div class="card-body">
             <div class="row align-items-end">
               <div class="col-md-6">
-                <label for="itemCookieFilter" class="form-label">筛选账号</label>
+                <label for="itemReplayCookieFilter" class="form-label">筛选账号</label>
                 <select class="form-select" id="itemReplayCookieFilter" onchange="loadItemsReplayByCookie()">
                   <option value="">所有账号</option>
                 </select>
               </div>
               <div class="col-md-6">
                 <div class="d-flex justify-content-end align-items-end gap-2">
-                  <!-- 页码输入 -->
-                  <div class="d-flex align-items-center gap-2">
-                    <label for="pageNumber" class="form-label mb-0 text-nowrap">页码:</label>
-                    <input type="number" class="form-control" id="pageNumber" placeholder="页码" min="1" value="1" style="width: 80px;">
-                  </div>
                   <div class="d-flex gap-2">
                     <button class="btn btn-success" onclick="showItemReplayEdit()">
                       添加商品回复
@@ -829,7 +845,7 @@
         <div class="card">
           <div class="card-header d-flex justify-content-between align-items-center">
             <h5 class="mb-0">商品列表(用于设置商品的默认回复信息)</h5>
-            <button class="btn btn-sm btn-outline-danger" onclick="batchDeleteItemReplies()">
+            <button class="btn btn-sm btn-outline-danger" id="batchDeleteItemRepliesBtn" onclick="batchDeleteItemReplies()" disabled>
               <i class="bi bi-trash"></i> 批量删除
             </button>
           </div>
@@ -839,7 +855,7 @@
                 <thead>
                   <tr>
                     <th style="width: 5%">
-                      <input type="checkbox" id="selectAllItemReplay" onchange="toggleSelectAll(this)">
+                      <input type="checkbox" id="selectAllItemReplies" onchange="toggleSelectAllItemReplies(this)">
                     </th>
                     <th style="width: 12%">账号ID</th>
                     <th style="width: 12%">商品ID</th>
@@ -852,7 +868,7 @@
                 </thead>
                 <tbody id="itemReplaysTableBody">
                   <tr>
-                    <td colspan="5" class="text-center text-muted">加载中...</td>
+                    <td colspan="8" class="text-center text-muted">加载中...</td>
                   </tr>
                 </tbody>
               </table>
@@ -896,7 +912,7 @@
             </div>
 
             <div class="mb-3">
-              <label for="editReplyContent" class="form-label">商品回复内容 <span class="text-danger">*</span></label>
+              <label for="editItemReplyContent" class="form-label">商品回复内容 <span class="text-danger">*</span></label>
               <textarea class="form-control" id="editItemReplyContent" rows="10"
                         placeholder="请输入商品回复内容..."></textarea>
               <div class="form-text">
@@ -941,12 +957,13 @@
               <option value="">所有状态</option>
               <option value="processing">处理中</option>
               <option value="pending_payment">待付款</option>
-              <option value="pending_delivery">待发货</option>
+              <option value="pending_ship">待发货</option>
+              <option value="partial_success">部分发货</option>
+              <option value="partial_pending_finalize">部分待收尾</option>
               <option value="shipped">已发货</option>
-              <option value="success">交易成功</option>
+              <option value="completed">交易成功</option>
               <option value="refunding">退款中</option>
-              <option value="refunded">退款成功</option>
-              <option value="closed">交易关闭</option>
+              <option value="cancelled">交易关闭</option>
               <option value="unknown">未知</option>
             </select>
           </div>
@@ -2126,18 +2143,18 @@
               <div class="col-md-3">
                 <label class="form-label">处理状态</label>
                 <div class="d-flex gap-2 flex-wrap">
-                  <span class="badge bg-secondary filter-badge active" data-status="" onclick="filterRiskLogsByStatus('')">
+                  <button type="button" class="badge bg-secondary filter-badge active border-0" data-status="" onclick="filterRiskLogsByStatus('')">
                     全部
-                  </span>
-                  <span class="badge bg-warning filter-badge" data-status="processing" onclick="filterRiskLogsByStatus('processing')">
+                  </button>
+                  <button type="button" class="badge bg-warning filter-badge border-0" data-status="processing" onclick="filterRiskLogsByStatus('processing')">
                     处理中
-                  </span>
-                  <span class="badge bg-success filter-badge" data-status="success" onclick="filterRiskLogsByStatus('success')">
+                  </button>
+                  <button type="button" class="badge bg-success filter-badge border-0" data-status="success" onclick="filterRiskLogsByStatus('success')">
                     成功
-                  </span>
-                  <span class="badge bg-danger filter-badge" data-status="failed" onclick="filterRiskLogsByStatus('failed')">
+                  </button>
+                  <button type="button" class="badge bg-danger filter-badge border-0" data-status="failed" onclick="filterRiskLogsByStatus('failed')">
                     失败
-                  </span>
+                  </button>
                 </div>
               </div>
               <div class="col-md-2">
@@ -2159,8 +2176,8 @@
               <i class="bi bi-list-ul me-2"></i>
               风控日志记录
             </h5>
-            <div class="d-flex gap-2">
-              <span id="riskLogCount" class="badge bg-info">总计: 0 条</span>
+            <div class="d-flex gap-2 align-items-center">
+              <span id="riskLogCount" class="badge bg-info toolbar-count-badge">记录数: 0 条</span>
               <button class="btn btn-sm btn-outline-danger" onclick="clearRiskControlLogs()" title="清空日志">
                 <i class="bi bi-trash"></i> 清空
               </button>
@@ -4092,11 +4109,11 @@
         </div>
         <div class="modal-body">
           <form id="editDefaultReplyForm">
-            <input type="hidden" id="editAccountId" />
+            <input type="hidden" id="editDefaultReplyAccountId" />
 
             <div class="mb-3">
               <label class="form-label">账号ID</label>
-              <input type="text" class="form-control" id="editAccountIdDisplay" readonly />
+              <input type="text" class="form-control" id="editDefaultReplyAccountIdDisplay" readonly />
             </div>
 
             <div class="mb-3">
@@ -4645,13 +4662,13 @@
         <div class="modal-header">
           <h5 class="modal-title">
             <i class="bi bi-pencil-square me-2"></i>
-            编辑账号信息 - <span id="editAccountIdDisplay"></span>
+            编辑账号信息 - <span id="accountEditIdDisplay"></span>
           </h5>
           <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
         </div>
         <div class="modal-body">
           <form id="accountEditForm">
-            <input type="hidden" id="editAccountId">
+            <input type="hidden" id="accountEditId">
             
             <div class="mb-3">
               <label class="form-label">Cookie <span class="text-danger">*</span></label>

@@ -91,9 +91,9 @@ def send_notification(user_id: str, title: str, message: str, notification_type:
                                 msg = MIMEMultipart()
                                 msg['From'] = smtp_from
                                 msg['To'] = recipient_email
-                                msg['Subject'] = f"闲鱼自动回复通知 - {title}"
+                                msg['Subject'] = f"闲鱼管理系统通知 - {title}"
 
-                                email_body = f"""【闲鱼自动回复系统通知】
+                                email_body = f"""【闲鱼管理系统通知】
 
 标题：{title}
 
@@ -2483,4 +2483,3 @@ if __name__ != "__main__":
         apply_patches()
     except:
         pass  # 如果导入失败，忽略错误
-

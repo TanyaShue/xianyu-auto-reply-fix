@@ -5138,7 +5138,7 @@ class XianyuSliderStealth:
                                                 f"账号: {self.pure_user_id}\n"
                                                 f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                                                 f"请登录自动化网站，访问账号管理模块，进行对应账号的验证。"
-                                                f"在验证期间，闲鱼自动回复暂时无法使用。"
+                                                f"在验证期间，自动回复功能暂时无法使用。"
                                             )
                                         else:
                                             notification_msg = (
@@ -5146,7 +5146,7 @@ class XianyuSliderStealth:
                                                 f"账号: {self.pure_user_id}\n"
                                                 f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                                                 f"请点击验证链接完成验证:\n{frame_url}\n\n"
-                                                f"在验证期间，闲鱼自动回复暂时无法使用。"
+                                                f"在验证期间，自动回复功能暂时无法使用。"
                                             )
 
                                         logger.info(f"【{self.pure_user_id}】准备发送{type_name}通知，截图路径: {screenshot_path}, URL: {frame_url}")

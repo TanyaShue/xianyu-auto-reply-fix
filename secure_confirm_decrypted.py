@@ -95,10 +95,6 @@ class SecureConfirm:
             self._current_item_id = item_id
             logger.debug(f"【{self.cookie_id}】设置当前商品ID: {item_id}")
 
-        # 确保session已创建
-        if not self.session:
-            raise Exception("Session未创建")
-
         params = {
             'jsv': '2.7.2',
             'appKey': '34839810',
@@ -134,43 +130,60 @@ class SecureConfirm:
 
             # 设置请求超时
             request_timeout = aiohttp.ClientTimeout(total=30)
+            # 避免跨事件循环复用session导致的timeout上下文错误；每次请求使用当前协程内的新session
+            request_headers = {
+                'cookie': self.cookies_str,
+                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                              '(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+                'accept': 'application/json',
+                'content-type': 'application/x-www-form-urlencoded'
+            }
 
-            async with self.session.post(
-                'https://h5api.m.goofish.com/h5/mtop.taobao.idle.logistic.consign.dummy/1.0/',
-                params=params,
-                data=data,
-                timeout=request_timeout
-            ) as response:
-                res_json = await response.json()
+            # 如主实例配置了HTTP代理，沿用代理
+            proxy_url = None
+            try:
+                if self.main_instance is not None:
+                    proxy_url = getattr(self.main_instance, '_http_proxy_url', None)
+            except Exception:
+                proxy_url = None
 
-                # 检查并更新Cookie
-                if 'set-cookie' in response.headers:
-                    new_cookies = {}
-                    for cookie in response.headers.getall('set-cookie', []):
-                        if '=' in cookie:
-                            name, value = cookie.split(';')[0].split('=', 1)
-                            new_cookies[name.strip()] = value.strip()
+            async with aiohttp.ClientSession(headers=request_headers, timeout=request_timeout) as session:
+                async with session.post(
+                    'https://h5api.m.goofish.com/h5/mtop.taobao.idle.logistic.consign.dummy/1.0/',
+                    params=params,
+                    data=data,
+                    proxy=proxy_url
+                ) as response:
+                    res_json = await response.json()
 
-                    # 更新cookies
-                    if new_cookies:
-                        self.cookies.update(new_cookies)
-                        # 生成新的cookie字符串
-                        self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
-                        # 更新数据库中的Cookie
-                        await self._update_config_cookies()
-                        logger.debug("已更新Cookie到数据库")
+                    # 检查并更新Cookie
+                    if 'set-cookie' in response.headers:
+                        new_cookies = {}
+                        for cookie in response.headers.getall('set-cookie', []):
+                            if '=' in cookie:
+                                name, value = cookie.split(';')[0].split('=', 1)
+                                new_cookies[name.strip()] = value.strip()
 
-                logger.info(f"【{self.cookie_id}】自动确认发货响应: {res_json}")
+                        # 更新cookies
+                        if new_cookies:
+                            self.cookies.update(new_cookies)
+                            # 生成新的cookie字符串
+                            self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
+                            # 更新数据库中的Cookie
+                            await self._update_config_cookies()
+                            logger.debug("已更新Cookie到数据库")
 
-                # 检查响应结果
-                if res_json.get('ret') and res_json['ret'][0] == 'SUCCESS::调用成功':
-                    logger.info(f"【{self.cookie_id}】✅ 自动确认发货成功，订单ID: {order_id}")
-                    return {"success": True, "order_id": order_id}
-                else:
-                    error_msg = res_json.get('ret', ['未知错误'])[0] if res_json.get('ret') else '未知错误'
-                    logger.warning(f"【{self.cookie_id}】❌ 自动确认发货失败: {error_msg}")
+                    logger.info(f"【{self.cookie_id}】自动确认发货响应: {res_json}")
 
-                    return await self.auto_confirm(order_id, item_id, retry_count + 1)
+                    # 检查响应结果
+                    if res_json.get('ret') and res_json['ret'][0] == 'SUCCESS::调用成功':
+                        logger.info(f"【{self.cookie_id}】✅ 自动确认发货成功，订单ID: {order_id}")
+                        return {"success": True, "order_id": order_id}
+                    else:
+                        error_msg = res_json.get('ret', ['未知错误'])[0] if res_json.get('ret') else '未知错误'
+                        logger.warning(f"【{self.cookie_id}】❌ 自动确认发货失败: {error_msg}")
+
+                        return await self.auto_confirm(order_id, item_id, retry_count + 1)
 
 
         except Exception as e:

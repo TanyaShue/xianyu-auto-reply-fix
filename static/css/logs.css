@@ -82,6 +82,12 @@
   transition: all 0.2s;
   margin-right: 0.5rem;
   margin-bottom: 0.25rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 32px;
+  padding: 0.45rem 0.8rem;
+  line-height: 1;
 }
 
 .filter-badge:hover {
@@ -90,6 +96,16 @@
 
 .filter-badge.active {
   box-shadow: 0 0 0 2px rgba(255,255,255,0.5);
+}
+
+.toolbar-count-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 32px;
+  padding: 0.5rem 0.875rem;
+  line-height: 1;
+  white-space: nowrap;
 }
 
 /* 自动刷新指示器 */
