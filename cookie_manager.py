@@ -26,6 +26,19 @@ class CookieManager:
         # 账号状态存储 {cookie_id: {connection_state, cookie_valid, last_check_time, ...}}
         self.account_status: Dict[str, Dict] = {}
 
+        # 默认账号状态模板
+        self._default_account_status = {
+            'connection_state': 'disconnected',
+            'cookie_valid': None,
+            'last_check_time': None,
+            'error_message': None,
+            'last_refresh_time': None,
+            'is_refreshing': False,
+            'refresh_start_time': None,
+            'refresh_reason': None,
+            'global_refresh_failures': 0
+        }
+
         self._load_from_db()
 
     def _load_from_db(self):
@@ -482,16 +495,7 @@ class CookieManager:
             **kwargs: 状态字段（如connection_state, cookie_valid, error_message等）
         """
         if cookie_id not in self.account_status:
-            self.account_status[cookie_id] = {
-                'connection_state': 'disconnected',
-                'cookie_valid': None,
-                'last_check_time': None,
-                'error_message': None,
-                'last_refresh_time': None,
-                'is_refreshing': False,
-                'refresh_start_time': None,  # 刷新开始时间
-                'refresh_reason': None       # 刷新原因
-            }
+            self.account_status[cookie_id] = self._default_account_status.copy()
 
         self.account_status[cookie_id].update(kwargs)
 
@@ -510,16 +514,7 @@ class CookieManager:
         """
         if cookie_id not in self.account_status:
             # 返回默认状态
-            return {
-                'connection_state': 'disconnected',
-                'cookie_valid': None,
-                'last_check_time': None,
-                'error_message': None,
-                'last_refresh_time': None,
-                'is_refreshing': False,
-                'refresh_start_time': None,
-                'refresh_reason': None
-            }
+            return self._default_account_status.copy()
         return self.account_status[cookie_id].copy()
 
     def get_all_account_status(self) -> Dict[str, Dict]:
@@ -557,6 +552,49 @@ class CookieManager:
             error_message=error,
             last_check_time=int(time.time())
         )
+
+    def increment_refresh_failures(self, cookie_id: str) -> int:
+        """递增Cookie刷新失败计数
+
+        Args:
+            cookie_id: Cookie ID
+
+        Returns:
+            int: 当前失败次数
+        """
+        if cookie_id not in self.account_status:
+            self.account_status[cookie_id] = self._default_account_status.copy()
+
+        current_failures = self.account_status[cookie_id].get('global_refresh_failures', 0)
+        current_failures += 1
+        self.account_status[cookie_id]['global_refresh_failures'] = current_failures
+        logger.warning(f"【{cookie_id}】Cookie刷新失败计数: {current_failures}/10")
+        return current_failures
+
+    def reset_refresh_failures(self, cookie_id: str):
+        """重置Cookie刷新失败计数（刷新成功时调用）
+
+        Args:
+            cookie_id: Cookie ID
+        """
+        if cookie_id in self.account_status:
+            old_count = self.account_status[cookie_id].get('global_refresh_failures', 0)
+            if old_count > 0:
+                self.account_status[cookie_id]['global_refresh_failures'] = 0
+                logger.info(f"【{cookie_id}】Cookie刷新成功，重置失败计数（之前: {old_count}次）")
+
+    def get_refresh_failures(self, cookie_id: str) -> int:
+        """获取Cookie刷新失败次数
+
+        Args:
+            cookie_id: Cookie ID
+
+        Returns:
+            int: 当前失败次数
+        """
+        if cookie_id not in self.account_status:
+            return 0
+        return self.account_status[cookie_id].get('global_refresh_failures', 0)
 
 
 # 在 Start.py 中会把此变量赋值为具体实例

@@ -223,7 +223,102 @@ class XianyuLive:
     # 类级别的密码登录时间记录，用于防止重复登录
     _last_password_login_time = {}  # {cookie_id: timestamp}
     _password_login_cooldown = 60  # 密码登录冷却时间：60秒
-    
+
+    # 失败阈值常量
+    COOKIE_REFRESH_FAILURE_THRESHOLD = 10  # Cookie刷新失败阈值
+    CONNECTION_FAILURE_THRESHOLD = 3  # 连接失败阈值（致命失败）
+
+    async def _handle_cookie_refresh_failure(self, error_type: str, error_msg: str = None) -> bool:
+        """统一处理Cookie刷新失败逻辑
+
+        Args:
+            error_type: 错误类型 ('failure', 'timeout', 'exception')
+            error_msg: 可选的错误详情
+
+        Returns:
+            bool: True表示达到阈值，自动刷新已禁用
+        """
+        from cookie_manager import manager as cookie_manager
+
+        if not cookie_manager:
+            log_msg = f"【{self.cookie_id}】❌ Cookie刷新{error_type}"
+            if error_msg:
+                log_msg += f": {error_msg}"
+            logger.warning(log_msg)
+            return False
+
+        failure_count = cookie_manager.increment_refresh_failures(self.cookie_id)
+        threshold = self.COOKIE_REFRESH_FAILURE_THRESHOLD
+
+        log_msg = f"【{self.cookie_id}】❌ Cookie刷新{error_type} (第{failure_count}/{threshold}次)"
+        if error_msg:
+            log_msg = f"【{self.cookie_id}】❌ Cookie刷新{error_type}: {error_msg} (第{failure_count}/{threshold}次)"
+        logger.warning(log_msg) if error_type != 'exception' else logger.error(log_msg)
+
+        if failure_count >= threshold:
+            logger.error(f"【{self.cookie_id}】❌ Cookie刷新连续失败{threshold}次，停止自动刷新，请手动处理")
+            await self.send_token_refresh_notification(
+                f"Cookie刷新连续失败{threshold}次，已停止自动刷新，请手动检查账号状态",
+                "cookie_refresh_max_failures"
+            )
+            self.cookie_refresh_enabled = False
+            return True
+        return False
+
+    async def _handle_connection_failure(self, error_msg: str, error_detail: str = None) -> bool:
+        """统一处理连接失败逻辑（致命失败）
+
+        Args:
+            error_msg: 错误消息
+            error_detail: 可选的错误详情
+
+        Returns:
+            bool: True表示达到阈值，应退出主循环
+        """
+        from cookie_manager import manager as cookie_manager
+
+        if not cookie_manager:
+            logger.warning(f"【{self.cookie_id}】❌ {error_msg}")
+            return False
+
+        failure_count = cookie_manager.increment_refresh_failures(self.cookie_id)
+        threshold = self.CONNECTION_FAILURE_THRESHOLD
+
+        logger.warning(f"【{self.cookie_id}】❌ {error_msg} (致命失败第{failure_count}/{threshold}次)")
+
+        if failure_count >= threshold:
+            logger.error(f"【{self.cookie_id}】❌ 连续多次无法恢复连接，已停止自动重连，请手动处理Cookie")
+
+            # 设置连接状态为失败
+            self._set_connection_state(ConnectionState.FAILED, "Cookie失效，已停止自动重连")
+
+            # 更新账号Cookie状态为无效
+            full_error = error_msg
+            if error_detail:
+                full_error = f"{error_msg}: {error_detail}"
+            cookie_manager.update_cookie_validity(self.cookie_id, False, full_error)
+
+            # 记录风控日志
+            try:
+                from db_manager import db_manager
+                db_manager.add_risk_control_log(
+                    cookie_id=self.cookie_id,
+                    event_type='connection_max_failures',
+                    event_description='连续多次无法恢复连接，已停止自动重连',
+                    processing_status='failed',
+                    error_message=full_error
+                )
+                logger.info(f"【{self.cookie_id}】风控日志记录成功")
+            except Exception as log_e:
+                logger.error(f"【{self.cookie_id}】记录风控日志失败: {log_e}")
+
+            await self.send_token_refresh_notification(
+                "连续多次无法恢复连接，已停止自动重连。请检查Cookie是否有效或配置用户名密码进行自动刷新。",
+                "connection_max_failures"
+            )
+            return True
+        return False
+
     def _safe_str(self, e):
         """安全地将异常转换为字符串"""
         try:
@@ -8603,10 +8698,11 @@ Cookie数量: {cookie_count}
 
                     if success:
                         self.last_cookie_refresh_time = current_time
-                        logger.info(f"【{self.cookie_id}】Cookie刷新任务完成，心跳已恢复")
+                        logger.info(f"【{self.cookie_id}】✅ Cookie刷新成功")
 
-                        # 更新刷新时间到状态
+                        # 更新刷新时间到状态并重置失败计数
                         if cookie_manager:
+                            cookie_manager.reset_refresh_failures(self.cookie_id)
                             cookie_manager.update_account_status(
                                 self.cookie_id,
                                 last_refresh_time=int(time.time()),
@@ -8654,15 +8750,19 @@ Cookie数量: {cookie_count}
                             import traceback
                             logger.error(f"【{self.cookie_id}】详细堆栈:\n{traceback.format_exc()}")
                     else:
-                        logger.warning(f"【{self.cookie_id}】Cookie刷新任务失败")
+                        # 刷新失败，递增失败计数
+                        await self._handle_cookie_refresh_failure("失败")
                         # 即使失败也要更新时间，避免频繁重试
                         self.last_cookie_refresh_time = current_time
 
                 except asyncio.TimeoutError:
+                    # 超时也算失败，递增计数
+                    await self._handle_cookie_refresh_failure("超时")
                     # 超时也要更新时间，避免频繁重试
                     self.last_cookie_refresh_time = current_time
                 except Exception as e:
-                    logger.error(f"【{self.cookie_id}】执行Cookie刷新任务异常: {self._safe_str(e)}")
+                    # 异常也算失败，递增计数
+                    await self._handle_cookie_refresh_failure("异常", self._safe_str(e))
                     # 异常也要更新时间，避免频繁重试
                     self.last_cookie_refresh_time = current_time
                 finally:
@@ -11397,6 +11497,12 @@ Cookie数量: {cookie_count}
                             self.connection_failures = 0
                             self.last_successful_connection = time.time()
 
+                            # 重置致命失败计数并更新账号状态为有效（连接成功）
+                            from cookie_manager import manager as cookie_manager
+                            if cookie_manager:
+                                cookie_manager.reset_refresh_failures(self.cookie_id)
+                                cookie_manager.update_cookie_validity(self.cookie_id, True)
+
                             # 记录后台任务启动前的状态
                             logger.warning(f"【{self.cookie_id}】准备启动后台任务 - 当前状态: heartbeat={self.heartbeat_task}, token_refresh={self.token_refresh_task}, cleanup={self.cleanup_task}, cookie_refresh={self.cookie_refresh_task}")
                             
@@ -11564,10 +11670,16 @@ Cookie数量: {cookie_count}
                                 await asyncio.sleep(2)
                                 continue
                             else:
-                                logger.warning(f"【{self.cookie_id}】❌ 密码登录刷新失败，将重启实例...")
+                                # 密码登录刷新失败，递增致命失败计数
+                                should_exit = await self._handle_connection_failure("密码登录刷新失败")
+                                if should_exit:
+                                    return  # 退出主循环，不再重连
                         except Exception as refresh_e:
                             logger.error(f"【{self.cookie_id}】密码登录刷新过程异常: {self._safe_str(refresh_e)}")
-                            logger.warning(f"【{self.cookie_id}】将重启实例...")
+                            # 异常时也递增致命失败计数
+                            should_exit = await self._handle_connection_failure("密码登录刷新异常", self._safe_str(refresh_e))
+                            if should_exit:
+                                return  # 退出主循环，不再重连
                         
                         # 如果密码登录刷新失败或异常，则重启实例
                         logger.error(f"【{self.cookie_id}】准备重启实例...")
