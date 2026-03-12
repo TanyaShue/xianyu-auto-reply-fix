@@ -167,18 +167,7 @@ input:checked + .status-slider:before {
   100% { opacity: 1; }
 }
 
-/* Cookie刷新旋转动画 */
-.spin-animation {
-  display: inline-block;
-  animation: spin 1s linear infinite;
-}
-
-@keyframes spin {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
-}
-
-/* 刷新中脉冲效果 */
+/* Cookie刷新脉冲效果（spin-animation 已在 components.css 中定义）*/
 .refreshing-pulse {
   animation: refreshing-pulse-anim 1.5s ease-in-out infinite;
 }

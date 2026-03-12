@@ -2820,9 +2820,6 @@ function startAccountStatusRefresh() {
         }
     };
 
-    // 记录当前是否为快速刷新模式
-    window.isFastRefreshMode = false;
-
     // 启动新的定时器
     accountStatusRefreshTimer = setInterval(refreshStatus, ACCOUNT_STATUS_REFRESH_INTERVAL);
     // 立即执行一次刷新

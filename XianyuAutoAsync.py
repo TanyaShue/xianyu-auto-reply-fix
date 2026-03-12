@@ -4128,6 +4128,30 @@ class XianyuLive:
             # 发送Cookie更新失败通知
             await self.send_token_refresh_notification(f"Cookie更新失败: {str(e)}", "cookie_update_failed")
 
+    def _update_refresh_status(self, is_refreshing: bool, refresh_reason: str = None,
+                                refresh_start_time: int = None, last_refresh_time: int = None):
+        """更新账号刷新状态的辅助方法
+
+        Args:
+            is_refreshing: 是否正在刷新
+            refresh_reason: 刷新原因
+            refresh_start_time: 刷新开始时间（Unix时间戳）
+            last_refresh_time: 最后刷新时间（Unix时间戳）
+        """
+        try:
+            from cookie_manager import manager as cookie_manager_instance
+            if cookie_manager_instance:
+                kwargs = {'is_refreshing': is_refreshing}
+                if refresh_reason is not None:
+                    kwargs['refresh_reason'] = refresh_reason
+                if refresh_start_time is not None:
+                    kwargs['refresh_start_time'] = refresh_start_time
+                if last_refresh_time is not None:
+                    kwargs['last_refresh_time'] = last_refresh_time
+                cookie_manager_instance.update_account_status(self.cookie_id, **kwargs)
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】更新刷新状态失败: {e}")
+
     async def _try_password_login_refresh(self, trigger_reason: str = "令牌/Session过期"):
         """尝试通过密码登录刷新Cookie并重启实例
 
@@ -4150,15 +4174,12 @@ class XianyuLive:
             logger.warning(f"【{self.cookie_id}】提示：如果新Cookie仍然无效，请检查账号状态或手动更新Cookie")
             return False
 
-        # 【新增】设置刷新状态
-        from cookie_manager import manager as cookie_manager_instance
-        if cookie_manager_instance:
-            cookie_manager_instance.update_account_status(
-                self.cookie_id,
-                is_refreshing=True,
-                refresh_reason=trigger_reason,
-                refresh_start_time=int(time.time())
-            )
+        # 设置刷新状态
+        self._update_refresh_status(
+            is_refreshing=True,
+            refresh_reason=trigger_reason,
+            refresh_start_time=int(time.time())
+        )
 
         # 记录到日志文件
         log_captcha_event(self.cookie_id, f"{trigger_reason}触发Cookie刷新和实例重启", None,
@@ -4285,26 +4306,19 @@ class XianyuLive:
                 if update_success:
                     logger.info(f"【{self.cookie_id}】Cookie更新并重启任务成功")
                     # 清除刷新状态（实例会重启，状态会在重启后更新）
-                    if cookie_manager_instance:
-                        cookie_manager_instance.update_account_status(
-                            self.cookie_id,
-                            is_refreshing=False,
-                            last_refresh_time=int(time.time())
-                        )
+                    self._update_refresh_status(is_refreshing=False, last_refresh_time=int(time.time()))
                     # ⚠️ 不要在这里发送通知，因为重启已触发，任务即将被取消
                     return True
                 else:
                     logger.error(f"【{self.cookie_id}】Cookie更新失败")
                     # 清除刷新状态
-                    if cookie_manager_instance:
-                        cookie_manager_instance.update_account_status(self.cookie_id, is_refreshing=False)
+                    self._update_refresh_status(is_refreshing=False)
                     return False
 
             else:
                 logger.warning(f"【{self.cookie_id}】密码登录失败，未获取到Cookie")
                 # 清除刷新状态
-                if cookie_manager_instance:
-                    cookie_manager_instance.update_account_status(self.cookie_id, is_refreshing=False)
+                self._update_refresh_status(is_refreshing=False)
                 return False
 
         except Exception as refresh_e:
@@ -4312,8 +4326,7 @@ class XianyuLive:
             import traceback
             logger.error(f"【{self.cookie_id}】详细堆栈:\n{traceback.format_exc()}")
             # 清除刷新状态
-            if cookie_manager_instance:
-                cookie_manager_instance.update_account_status(self.cookie_id, is_refreshing=False)
+            self._update_refresh_status(is_refreshing=False)
             return False
 
     async def _verify_cookie_validity(self) -> dict:
