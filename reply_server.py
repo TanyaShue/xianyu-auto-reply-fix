@@ -2110,7 +2110,7 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
             'auto_comment': auto_comment,
             'remark': remark,
             'username': username,
-'password': password,
+'has_password': has_password,
             'pause_duration': cookie_details.get('pause_duration', 10) if cookie_details else 10,
             # 新增状态字段
             'connection_state': account_status.get('connection_state', 'disconnected'),
