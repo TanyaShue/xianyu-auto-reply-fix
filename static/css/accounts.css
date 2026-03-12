@@ -167,6 +167,37 @@ input:checked + .status-slider:before {
   100% { opacity: 1; }
 }
 
+/* Cookie刷新旋转动画 */
+.spin-animation {
+  display: inline-block;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+/* 刷新中脉冲效果 */
+.refreshing-pulse {
+  animation: refreshing-pulse-anim 1.5s ease-in-out infinite;
+}
+
+@keyframes refreshing-pulse-anim {
+  0% {
+    opacity: 1;
+    box-shadow: 0 0 0 0 rgba(13, 202, 240, 0.4);
+  }
+  50% {
+    opacity: 0.85;
+    box-shadow: 0 0 0 4px rgba(13, 202, 240, 0.1);
+  }
+  100% {
+    opacity: 1;
+    box-shadow: 0 0 0 0 rgba(13, 202, 240, 0);
+  }
+}
+
 .disabled-account-notice {
   background: #fef3c7;
   border: 1px solid #f59e0b;

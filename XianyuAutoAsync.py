@@ -4130,10 +4130,10 @@ class XianyuLive:
 
     async def _try_password_login_refresh(self, trigger_reason: str = "令牌/Session过期"):
         """尝试通过密码登录刷新Cookie并重启实例
-        
+
         Args:
             trigger_reason: 触发原因，用于日志记录
-            
+
         Returns:
             bool: 是否成功刷新Cookie
         """
@@ -4143,12 +4143,22 @@ class XianyuLive:
         current_time = time.time()
         last_password_login = XianyuLive._last_password_login_time.get(self.cookie_id, 0)
         time_since_last_login = current_time - last_password_login
-        
+
         if last_password_login > 0 and time_since_last_login < XianyuLive._password_login_cooldown:
             remaining_time = XianyuLive._password_login_cooldown - time_since_last_login
             logger.warning(f"【{self.cookie_id}】距离上次密码登录仅 {time_since_last_login:.1f} 秒，仍在冷却期内（还需等待 {remaining_time:.1f} 秒），跳过密码登录")
             logger.warning(f"【{self.cookie_id}】提示：如果新Cookie仍然无效，请检查账号状态或手动更新Cookie")
             return False
+
+        # 【新增】设置刷新状态
+        from cookie_manager import manager as cookie_manager_instance
+        if cookie_manager_instance:
+            cookie_manager_instance.update_account_status(
+                self.cookie_id,
+                is_refreshing=True,
+                refresh_reason=trigger_reason,
+                refresh_start_time=int(time.time())
+            )
 
         # 记录到日志文件
         log_captcha_event(self.cookie_id, f"{trigger_reason}触发Cookie刷新和实例重启", None,
@@ -4274,20 +4284,36 @@ class XianyuLive:
                 
                 if update_success:
                     logger.info(f"【{self.cookie_id}】Cookie更新并重启任务成功")
+                    # 清除刷新状态（实例会重启，状态会在重启后更新）
+                    if cookie_manager_instance:
+                        cookie_manager_instance.update_account_status(
+                            self.cookie_id,
+                            is_refreshing=False,
+                            last_refresh_time=int(time.time())
+                        )
                     # ⚠️ 不要在这里发送通知，因为重启已触发，任务即将被取消
                     return True
                 else:
                     logger.error(f"【{self.cookie_id}】Cookie更新失败")
+                    # 清除刷新状态
+                    if cookie_manager_instance:
+                        cookie_manager_instance.update_account_status(self.cookie_id, is_refreshing=False)
                     return False
-                    
+
             else:
                 logger.warning(f"【{self.cookie_id}】密码登录失败，未获取到Cookie")
+                # 清除刷新状态
+                if cookie_manager_instance:
+                    cookie_manager_instance.update_account_status(self.cookie_id, is_refreshing=False)
                 return False
 
         except Exception as refresh_e:
             logger.error(f"【{self.cookie_id}】Cookie刷新或实例重启失败: {self._safe_str(refresh_e)}")
             import traceback
             logger.error(f"【{self.cookie_id}】详细堆栈:\n{traceback.format_exc()}")
+            # 清除刷新状态
+            if cookie_manager_instance:
+                cookie_manager_instance.update_account_status(self.cookie_id, is_refreshing=False)
             return False
 
     async def _verify_cookie_validity(self) -> dict:
@@ -8530,8 +8556,13 @@ Cookie数量: {cookie_count}
             if not await cookie_manager.acquire_refresh_lock(self.cookie_id):
                 logger.warning(f"【{self.cookie_id}】其他实例正在刷新Cookie，跳过本次刷新")
                 return
-            # 更新刷新状态
-            cookie_manager.update_account_status(self.cookie_id, is_refreshing=True)
+            # 更新刷新状态（包含刷新原因和开始时间）
+            cookie_manager.update_account_status(
+                self.cookie_id,
+                is_refreshing=True,
+                refresh_reason="定时刷新任务",
+                refresh_start_time=int(time.time())
+            )
 
         try:
             # 使用实例级Lock确保原子性，防止重复执行

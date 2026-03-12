@@ -2692,12 +2692,17 @@ async function loadCookies() {
 
 // 状态刷新定时器
 let accountStatusRefreshTimer = null;
-const ACCOUNT_STATUS_REFRESH_INTERVAL = 30000; // 30秒刷新一次
+const ACCOUNT_STATUS_REFRESH_INTERVAL = 5000; // 5秒刷新一次（原30秒）
+const ACCOUNT_STATUS_REFRESH_FAST_INTERVAL = 2000; // 快速刷新间隔：2秒（有刷新任务时）
+let isFastRefreshMode = false; // 是否处于快速刷新模式
 
 /**
  * 获取连接状态标签
+ * @param {string} state - 连接状态
+ * @param {boolean} isRefreshing - 是否正在刷新
+ * @param {object} refreshInfo - 刷新信息 {refresh_start_time, refresh_reason}
  */
-function getConnectionStateBadge(state, isRefreshing) {
+function getConnectionStateBadge(state, isRefreshing, refreshInfo = null) {
     const stateMap = {
         'connected': { text: '已连接', class: 'bg-success', icon: 'wifi' },
         'connecting': { text: '连接中', class: 'bg-warning', icon: 'wifi-1' },
@@ -2709,9 +2714,31 @@ function getConnectionStateBadge(state, isRefreshing) {
 
     const info = stateMap[state] || stateMap['disconnected'];
 
-    // 如果正在刷新，显示刷新图标
+    // 如果正在刷新，显示刷新图标和详情
     if (isRefreshing) {
-        return `<span class="badge bg-info"><i class="bi bi-arrow-repeat spin-animation"></i> 刷新中</span>`;
+        let elapsedText = '';
+        let reasonText = '';
+
+        // 计算已用时间
+        if (refreshInfo && refreshInfo.refresh_start_time) {
+            const elapsed = Math.floor((Date.now() / 1000) - refreshInfo.refresh_start_time);
+            if (elapsed > 0) {
+                if (elapsed < 60) {
+                    elapsedText = ` ${elapsed}秒`;
+                } else {
+                    const mins = Math.floor(elapsed / 60);
+                    const secs = elapsed % 60;
+                    elapsedText = ` ${mins}分${secs}秒`;
+                }
+            }
+        }
+
+        // 显示刷新原因
+        if (refreshInfo && refreshInfo.refresh_reason) {
+            reasonText = ` title="${refreshInfo.refresh_reason}"`;
+        }
+
+        return `<span class="badge bg-info refreshing-pulse"${reasonText}><i class="bi bi-arrow-repeat spin-animation"></i> 刷新中${elapsedText}</span>`;
     }
 
     return `<span class="badge ${info.class}" title="WebSocket${info.text}"><i class="bi bi-${info.icon}"></i></span>`;
@@ -2719,11 +2746,18 @@ function getConnectionStateBadge(state, isRefreshing) {
 
 /**
  * 获取Cookie有效性标签
+ * @param {boolean} valid - Cookie是否有效
+ * @param {boolean} isRefreshing - 是否正在刷新
+ * @param {object} refreshInfo - 刷新信息 {refresh_reason}
  */
-function getCookieValidBadge(valid, isRefreshing) {
+function getCookieValidBadge(valid, isRefreshing, refreshInfo = null) {
     // 如果正在刷新
     if (isRefreshing) {
-        return `<span class="badge bg-info"><i class="bi bi-arrow-repeat spin-animation"></i></span>`;
+        let reasonText = '';
+        if (refreshInfo && refreshInfo.refresh_reason) {
+            reasonText = ` title="${refreshInfo.refresh_reason}"`;
+        }
+        return `<span class="badge bg-info refreshing-pulse"${reasonText}><i class="bi bi-arrow-repeat spin-animation"></i> 验证中</span>`;
     }
 
     // 如果未检查
@@ -2747,8 +2781,8 @@ function startAccountStatusRefresh() {
         clearInterval(accountStatusRefreshTimer);
     }
 
-    // 启动新的定时器
-    accountStatusRefreshTimer = setInterval(async () => {
+    // 定义刷新函数
+    const refreshStatus = async () => {
         // 检查是否在账号管理页面
         const accountsSection = document.getElementById('accounts-section');
         if (!accountsSection || !accountsSection.classList.contains('active')) {
@@ -2764,11 +2798,35 @@ function startAccountStatusRefresh() {
             if (response.ok) {
                 const statusData = await response.json();
                 updateAccountStatusDisplay(statusData);
+
+                // 智能轮询：检查是否有账号正在刷新
+                const hasRefreshing = Object.values(statusData).some(s => s.is_refreshing);
+
+                // 如果刷新状态发生变化，调整轮询间隔
+                if (hasRefreshing && !isFastRefreshMode) {
+                    isFastRefreshMode = true;
+                    clearInterval(accountStatusRefreshTimer);
+                    accountStatusRefreshTimer = setInterval(refreshStatus, ACCOUNT_STATUS_REFRESH_FAST_INTERVAL);
+                    console.log('切换到快速轮询模式 (2秒)');
+                } else if (!hasRefreshing && isFastRefreshMode) {
+                    isFastRefreshMode = false;
+                    clearInterval(accountStatusRefreshTimer);
+                    accountStatusRefreshTimer = setInterval(refreshStatus, ACCOUNT_STATUS_REFRESH_INTERVAL);
+                    console.log('切换到正常轮询模式 (5秒)');
+                }
             }
         } catch (error) {
             console.error('刷新账号状态失败:', error);
         }
-    }, ACCOUNT_STATUS_REFRESH_INTERVAL);
+    };
+
+    // 记录当前是否为快速刷新模式
+    window.isFastRefreshMode = false;
+
+    // 启动新的定时器
+    accountStatusRefreshTimer = setInterval(refreshStatus, ACCOUNT_STATUS_REFRESH_INTERVAL);
+    // 立即执行一次刷新
+    refreshStatus();
 }
 
 /**
@@ -2776,10 +2834,21 @@ function startAccountStatusRefresh() {
  */
 function updateAccountStatusDisplay(statusData) {
     for (const [cookieId, status] of Object.entries(statusData)) {
+        // 构建刷新信息对象
+        const refreshInfo = {
+            refresh_start_time: status.refresh_start_time,
+            refresh_reason: status.refresh_reason,
+            last_refresh_time: status.last_refresh_time
+        };
+
         // 更新连接状态
         const connectionCell = document.querySelector(`td[data-cookie-id="${cookieId}"][data-status-type="connection"]`);
         if (connectionCell) {
-            connectionCell.innerHTML = getConnectionStateBadge(status.connection_state, status.is_refreshing);
+            connectionCell.innerHTML = getConnectionStateBadge(
+                status.connection_state,
+                status.is_refreshing,
+                refreshInfo
+            );
         }
 
         // 更新Cookie状态
@@ -2787,7 +2856,7 @@ function updateAccountStatusDisplay(statusData) {
         if (cookieValidCell) {
             const checkBtn = status.is_refreshing ? 'disabled' : '';
             cookieValidCell.innerHTML = `
-                ${getCookieValidBadge(status.cookie_valid, status.is_refreshing)}
+                ${getCookieValidBadge(status.cookie_valid, status.is_refreshing, refreshInfo)}
                 <button class="btn-icon-xs ms-1" onclick="checkCookieValidity('${cookieId}')" title="检查Cookie" ${checkBtn}>
                     <i class="bi bi-arrow-clockwise"></i>
                 </button>

@@ -488,7 +488,9 @@ class CookieManager:
                 'last_check_time': None,
                 'error_message': None,
                 'last_refresh_time': None,
-                'is_refreshing': False
+                'is_refreshing': False,
+                'refresh_start_time': None,  # 刷新开始时间
+                'refresh_reason': None       # 刷新原因
             }
 
         self.account_status[cookie_id].update(kwargs)
@@ -514,7 +516,9 @@ class CookieManager:
                 'last_check_time': None,
                 'error_message': None,
                 'last_refresh_time': None,
-                'is_refreshing': False
+                'is_refreshing': False,
+                'refresh_start_time': None,
+                'refresh_reason': None
             }
         return self.account_status[cookie_id].copy()
 

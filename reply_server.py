@@ -2240,6 +2240,9 @@ def get_all_cookies_status(current_user: Dict[str, Any] = Depends(get_current_us
             'connection_state': account_status.get('connection_state', 'disconnected'),
             'cookie_valid': account_status.get('cookie_valid'),
             'is_refreshing': account_status.get('is_refreshing', False),
+            'refresh_start_time': account_status.get('refresh_start_time'),  # 新增
+            'refresh_reason': account_status.get('refresh_reason'),           # 新增
+            'last_refresh_time': account_status.get('last_refresh_time'),     # 新增
             'enabled': cookie_manager.manager.get_cookie_status(cookie_id)
         }
 
